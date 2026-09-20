@@ -10,8 +10,13 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src import crud, models, schemas
-from src.crud.document import SemanticRejectionResult, is_rejected_duplicate
+from src.crud.document import (
+    NeighbourScope,
+    SemanticRejectionResult,
+    is_rejected_duplicate,
+)
 from src.exceptions import ResourceNotFoundException
+from src.memory.bands import SAME_CLAIM_MAX
 
 
 class TestDocumentCRUD:
@@ -1320,8 +1325,8 @@ class TestSessionPurityInvariant:
 
         explicit_doc = self._doc("User likes coffee", session_name=session_a.name)
         with patch(
-            "src.crud.document.query_documents", new=AsyncMock(return_value=[])
-        ) as mock_query:
+            "src.crud.document.find_neighbours", new=AsyncMock(return_value=[])
+        ) as mock_find:
             rejected = await is_rejected_duplicate(
                 db_session,
                 explicit_doc,
@@ -1330,18 +1335,19 @@ class TestSessionPurityInvariant:
                 observed=test_peer2.name,
             )
         assert rejected is SemanticRejectionResult.NOT_DUPLICATE
-        assert mock_query.await_args is not None
-        assert mock_query.await_args.kwargs["filters"] == {
-            "level": "explicit",
-            "session_name": session_a.name,
-        }
+        assert mock_find.await_args is not None
+        assert mock_find.await_args.kwargs["scope"] == NeighbourScope.working(
+            explicit_doc
+        )
+        assert mock_find.await_args.kwargs["max_distance"] == SAME_CLAIM_MAX
+        assert mock_find.await_args.kwargs["top_k"] == 1
 
         deductive_doc = self._doc(
             "User likes coffee", session_name=None, level="deductive"
         )
         with patch(
-            "src.crud.document.query_documents", new=AsyncMock(return_value=[])
-        ) as mock_query:
+            "src.crud.document.find_neighbours", new=AsyncMock(return_value=[])
+        ) as mock_find:
             rejected = await is_rejected_duplicate(
                 db_session,
                 deductive_doc,
@@ -1350,8 +1356,12 @@ class TestSessionPurityInvariant:
                 observed=test_peer2.name,
             )
         assert rejected is SemanticRejectionResult.NOT_DUPLICATE
-        assert mock_query.await_args is not None
-        assert mock_query.await_args.kwargs["filters"] == {"level": "deductive"}
+        assert mock_find.await_args is not None
+        assert mock_find.await_args.kwargs["scope"] == NeighbourScope.working(
+            deductive_doc
+        )
+        assert mock_find.await_args.kwargs["max_distance"] == SAME_CLAIM_MAX
+        assert mock_find.await_args.kwargs["top_k"] == 1
 
     @pytest.mark.asyncio
     async def test_semantic_dedup_refuses_sessionless_explicit(
@@ -1366,8 +1376,8 @@ class TestSessionPurityInvariant:
 
         doc = self._doc("User likes coffee", session_name=None)
         with patch(
-            "src.crud.document.query_documents", new=AsyncMock(return_value=[])
-        ) as mock_query:
+            "src.crud.document.find_neighbours", new=AsyncMock(return_value=[])
+        ) as mock_find:
             rejected = await is_rejected_duplicate(
                 db_session,
                 doc,
@@ -1376,7 +1386,7 @@ class TestSessionPurityInvariant:
                 observed=test_peer2.name,
             )
         assert rejected is SemanticRejectionResult.NOT_DUPLICATE
-        mock_query.assert_not_awaited()
+        mock_find.assert_not_awaited()
 
 
 class TestCreateDocumentsConcurrency:

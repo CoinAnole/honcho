@@ -25,7 +25,9 @@ from src.exceptions import (
     ValidationException,
     VectorStoreError,
 )
+from src.memory.bands import SAME_CLAIM_MAX
 from src.utils.filter import apply_filter
+from src.utils.types import DocumentLevel
 from src.vector_store import (
     VectorRecord,
     VectorStore,
@@ -233,41 +235,150 @@ def _uses_pgvector() -> bool:
 
 
 # Shared by is_rejected_duplicate and create_documents candidate resolution.
-_SEMANTIC_DUP_MAX_DISTANCE = 0.05
+_SEMANTIC_DUP_MAX_DISTANCE = SAME_CLAIM_MAX
 _SEMANTIC_DUP_TOP_K = 1
 _SEMANTIC_CANDIDATE_CONCURRENCY = 8
 
 
-def _semantic_dup_filters(doc: schemas.DocumentCreate) -> dict[str, Any] | None:
-    """Merge scope for semantic dedup: never across levels, never across
-    sessions for explicit documents. None when the document has no valid
-    merge partner (session-less explicit)."""
-    filters: dict[str, Any] = {"level": doc.level}
-    if doc.level == "explicit":
-        if doc.session_name is None:
+@dataclass(frozen=True, slots=True)
+class Neighbour:
+    """One similarity hit. `distance` is cosine distance on both vector paths."""
+
+    id: str
+    distance: float
+    level: DocumentLevel
+    session_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NeighbourScope:
+    """Which rows may answer a neighbour query.
+
+    Constructors are the only intended way to build one so level and session
+    rules live here, not at call sites.
+    """
+
+    levels: frozenset[DocumentLevel]
+    session_name: str | None = None
+
+    @staticmethod
+    def working(doc: schemas.DocumentCreate) -> "NeighbourScope | None":
+        """Same level, and same session for explicit.
+
+        None when a session-less explicit has no valid partner.
+        """
+        if doc.level == "explicit" and doc.session_name is None:
             return None
-        filters["session_name"] = doc.session_name
-    return filters
+        return NeighbourScope(
+            levels=frozenset({doc.level}),
+            session_name=doc.session_name if doc.level == "explicit" else None,
+        )
+
+    @staticmethod
+    def established() -> "NeighbourScope":
+        """Live derived rows. contradiction is excluded."""
+        return NeighbourScope(levels=frozenset({"inductive", "deductive"}))
+
+    def filters(self) -> dict[str, Any]:
+        """Filter dict for apply_filter and the external vector store."""
+        if len(self.levels) == 1:
+            level_filter: str | dict[str, list[str]] = next(iter(self.levels))
+        else:
+            level_filter = {"in": sorted(self.levels)}
+        out: dict[str, Any] = {"level": level_filter}
+        if self.session_name is not None:
+            out["session_name"] = self.session_name
+        return out
 
 
-async def query_external_vector_document_ids(
+def _neighbour_from_document(doc: models.Document, distance: float) -> Neighbour:
+    return Neighbour(
+        id=doc.id,
+        distance=float(distance),
+        level=doc.level,
+        session_name=doc.session_name,
+    )
+
+
+async def find_neighbours(
+    db: AsyncSession,
+    workspace_name: str,
+    *,
+    observer: str,
+    observed: str,
+    embedding: list[float],
+    scope: NeighbourScope,
+    max_distance: float | None,
+    top_k: int,
+) -> list[Neighbour]:
+    """Similarity lookup. Ascending by cosine distance, at most top_k.
+
+    Never embeds. Caller supplies the vector. On the external path the store
+    is queried before any DB statement.
+    """
+    if top_k <= 0:
+        return []
+
+    filters = scope.filters()
+
+    if _uses_pgvector():
+        distance_expr = models.Document.embedding.cosine_distance(embedding)
+        stmt = (
+            select(models.Document, distance_expr.label("distance"))
+            .where(models.Document.workspace_name == workspace_name)
+            .where(models.Document.observer == observer)
+            .where(models.Document.observed == observed)
+            .where(models.Document.embedding.isnot(None))
+            .where(models.Document.deleted_at.is_(None))
+        )
+        if max_distance is not None:
+            stmt = stmt.where(distance_expr <= max_distance)
+        stmt = apply_filter(stmt, models.Document, filters)
+        stmt = stmt.order_by(distance_expr).limit(top_k)
+        result = await db.execute(stmt)
+        return [
+            _neighbour_from_document(doc, distance) for doc, distance in result.all()
+        ]
+
+    hits = await _query_external_vector_hits(
+        workspace_name,
+        observer,
+        observed,
+        embedding,
+        top_k=top_k,
+        max_distance=max_distance,
+        filters=filters,
+    )
+    if not hits:
+        return []
+
+    documents = await fetch_documents_by_ids(
+        db=db,
+        workspace_name=workspace_name,
+        observer=observer,
+        observed=observed,
+        document_ids=[hit_id for hit_id, _ in hits],
+        filters=filters,
+    )
+    score_by_id = {hit_id: score for hit_id, score in hits}
+    return [
+        _neighbour_from_document(doc, score_by_id[doc.id])
+        for doc in documents
+        if doc.id in score_by_id
+    ]
+
+
+async def _query_external_vector_hits(
     workspace_name: str,
     observer: str,
     observed: str,
     embedding: list[float],
-    top_k: int = 5,
-    max_distance: float | None = None,
-    filters: dict[str, Any] | None = None,
-) -> list[str] | None:
-    """Query external vector store for document IDs sorted by similarity.
-
-    No DB session needed — safe to call outside a tracked_db scope.
-
-    Returns:
-        Ordered list of document IDs on the external-store path,
-        empty list when the external store has no results,
-        or None when the pgvector (DB-only) path should be used instead.
-    """
+    *,
+    top_k: int,
+    max_distance: float | None,
+    filters: dict[str, Any] | None,
+) -> list[tuple[str, float]] | None:
+    """Query the external store. None means the pgvector path should be used."""
     if _uses_pgvector():
         return None
 
@@ -300,7 +411,39 @@ async def query_external_vector_document_ids(
     if not vector_results:
         return []
 
-    return [result.id for result in vector_results]
+    return [(result.id, result.score) for result in vector_results]
+
+
+async def query_external_vector_document_ids(
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    embedding: list[float],
+    top_k: int = 5,
+    max_distance: float | None = None,
+    filters: dict[str, Any] | None = None,
+) -> list[str] | None:
+    """Query external vector store for document IDs sorted by similarity.
+
+    No DB session needed — safe to call outside a tracked_db scope.
+
+    Returns:
+        Ordered list of document IDs on the external-store path,
+        empty list when the external store has no results,
+        or None when the pgvector (DB-only) path should be used instead.
+    """
+    hits = await _query_external_vector_hits(
+        workspace_name,
+        observer,
+        observed,
+        embedding,
+        top_k=top_k,
+        max_distance=max_distance,
+        filters=filters,
+    )
+    if hits is None:
+        return None
+    return [hit_id for hit_id, _ in hits]
 
 
 async def fetch_documents_by_ids(
@@ -572,8 +715,8 @@ async def create_documents(
         resolve_sem = asyncio.Semaphore(_SEMANTIC_CANDIDATE_CONCURRENCY)
 
         async def _resolve_candidates(index: int, doc: schemas.DocumentCreate) -> None:
-            filters = _semantic_dup_filters(doc)
-            if filters is None or not doc.embedding:
+            scope = NeighbourScope.working(doc)
+            if scope is None or not doc.embedding:
                 semantic_candidates[index] = []
                 return
             async with resolve_sem:
@@ -585,7 +728,7 @@ async def create_documents(
                         embedding=doc.embedding,
                         top_k=_SEMANTIC_DUP_TOP_K,
                         max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
-                        filters=filters,
+                        filters=scope.filters(),
                     )
                 except Exception:
                     logger.exception(
@@ -1376,8 +1519,8 @@ async def _semantic_dup_decision(
     candidate_document_ids: list[str] | None = None,
 ) -> tuple[SemanticRejectionResult, models.Document | None]:
     """Classify a semantic duplicate without writing."""
-    filters = _semantic_dup_filters(doc)
-    if filters is None:
+    scope = NeighbourScope.working(doc)
+    if scope is None:
         return SemanticRejectionResult.NOT_DUPLICATE, None
 
     if candidate_document_ids is not None:
@@ -1387,30 +1530,38 @@ async def _semantic_dup_decision(
             observer=observer,
             observed=observed,
             document_ids=candidate_document_ids,
-            filters=filters,
+            filters=scope.filters(),
         )
-    elif _uses_pgvector():
+        if not similar_docs:
+            return SemanticRejectionResult.NOT_DUPLICATE, None
+        existing_doc = similar_docs[0]
+    else:
         if not doc.embedding:
             # Match external-store path: never embed under an open session.
             return SemanticRejectionResult.NOT_DUPLICATE, None
-        similar_docs = await query_documents(
-            db=db,
-            workspace_name=workspace_name,
-            query=doc.content,
+        neighbours = await find_neighbours(
+            db,
+            workspace_name,
             observer=observer,
             observed=observed,
-            filters=filters,
+            embedding=doc.embedding,
+            scope=scope,
             max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
             top_k=_SEMANTIC_DUP_TOP_K,
-            embedding=doc.embedding,
         )
-    else:
-        return SemanticRejectionResult.NOT_DUPLICATE, None
-
-    if not similar_docs:
-        return SemanticRejectionResult.NOT_DUPLICATE, None
-
-    existing_doc = similar_docs[0]
+        if not neighbours:
+            return SemanticRejectionResult.NOT_DUPLICATE, None
+        similar_docs = await fetch_documents_by_ids(
+            db=db,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            document_ids=[neighbours[0].id],
+            filters=scope.filters(),
+        )
+        if not similar_docs:
+            return SemanticRejectionResult.NOT_DUPLICATE, None
+        existing_doc = similar_docs[0]
     tokens_new = set(embedding_client.encoding.encode(doc.content))
     tokens_existing = set(embedding_client.encoding.encode(existing_doc.content))
     unique_new = len(tokens_new - tokens_existing)

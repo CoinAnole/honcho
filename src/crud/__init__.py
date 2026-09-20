@@ -11,12 +11,15 @@ from .deriver import (
 )
 from .document import (
     CreateDocumentsResult,
+    Neighbour,
+    NeighbourScope,
     create_documents,
     create_observations,
     delete_document,
     delete_document_by_id,
     delete_documents,
     fetch_documents_by_ids,
+    find_neighbours,
     get_all_documents,
     get_child_observations,
     get_documents_by_ids,
@@ -116,7 +119,10 @@ __all__ = [
     "get_queue_status",
     # Document
     "CreateDocumentsResult",
+    "Neighbour",
+    "NeighbourScope",
     "create_documents",
+    "find_neighbours",
     "create_observations",
     "fetch_documents_by_ids",
     "get_all_documents",

@@ -287,7 +287,11 @@ async def setup_test_database(db_url: URL):
     Returns:
         engine: SQLAlchemy engine
     """
-    engine = create_async_engine(str(db_url), echo=False)
+    # str(URL) redacts the password as "***" (SQLAlchemy default), which
+    # breaks auth. Keep the real credentials for the async engine.
+    engine = create_async_engine(
+        db_url.render_as_string(hide_password=False), echo=False
+    )
     async with engine.connect() as conn:
         try:
             logger.info("Attempting to create pgvector extension...")
