@@ -8,7 +8,8 @@ instead. Dreamer stays a backup consolidator.
 Stateless between runs: an explicit is examined when
 ``internal_metadata.promotion_examined_at`` is set. The stamp lands in the
 same txn as mint/reinforce so a crash before commit re-examines (idempotent
-via exact-dedup mint + evidence keys).
+via exact-dedup mint + evidence keys). ``Leave(undecided)`` skips the stamp
+so an LLM ``UNDECIDED`` can retry.
 
 MODE gating (PR4 choice):
 
@@ -454,11 +455,12 @@ async def _apply_one(
         metrics.examined += 1
         return
 
-    # Leave / residual NeedsConfirm → stamp anyway (stateless progress).
+    # Leave(undecided) stays unstamped so an LLM UNDECIDED can retry.
+    # Leave(unrelated) and residual NeedsConfirm stamp (stateless progress).
     if isinstance(verdict, Leave) and verdict.reason == "undecided":
         metrics.undecided += 1
-    else:
-        metrics.left_working += 1
+        return
+    metrics.left_working += 1
     _stamp_examined(seed_row, now)
     metrics.examined += 1
 
