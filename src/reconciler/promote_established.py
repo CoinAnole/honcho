@@ -35,8 +35,8 @@ from src.config import settings
 from src.crud.document import (
     Neighbour,
     NeighbourScope,
-    _DocumentRowOp,
     _apply_document_row_updates,
+    _DocumentRowOp,
     fetch_documents_by_ids,
     find_neighbours,
 )
@@ -258,8 +258,6 @@ async def _claim_and_snapshot(
             )
             continue
 
-        session_name = shell.seed.session_name
-        assert session_name is not None
         established = await find_neighbours(
             db,
             shell.workspace_name,
@@ -276,7 +274,7 @@ async def _claim_and_snapshot(
             observer=shell.observer,
             observed=shell.observed,
             embedding=shell.embedding,
-            scope=NeighbourScope.working_cross_session(exclude_session=session_name),
+            scope=NeighbourScope.working_peers(exclude_id=shell.seed.id),
             max_distance=CANDIDATE_MAX,
             top_k=top_k,
         )

@@ -188,9 +188,7 @@ class TestPromoteEstablished:
         assert await has_pending_promotion_work(db_session) is True
 
         established_mode("on")
-        metrics = await run_promotion_cycle(
-            batch_size=50, confirmer=NeverConfirmer()
-        )
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
         assert metrics.examined == 2
         assert await has_pending_promotion_work(db_session) is False
 
@@ -231,9 +229,7 @@ class TestPromoteEstablished:
         await db_session.commit()
 
         established_mode("on")
-        metrics = await run_promotion_cycle(
-            batch_size=50, confirmer=NeverConfirmer()
-        )
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
 
         assert metrics.promoted == 1
         assert metrics.examined == 2
@@ -253,6 +249,121 @@ class TestPromoteEstablished:
             (doc.internal_metadata or {}).get("promotion_examined_at")
             for doc in explicits
         )
+
+    @pytest.mark.asyncio
+    async def test_same_session_peers_promote_across_independence_gap(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session_a, _session_b = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        await crud.create_documents(
+            db_session,
+            [
+                _explicit(
+                    "Alice likes tea in the morning",
+                    embedding=_axis_embedding(),
+                    session_name=session_a.name,
+                    message_id=10,
+                    message_created_at="2026-01-01T00:00:00Z",
+                ),
+                _explicit(
+                    "Alice drinks tea before work",
+                    embedding=_embedding_at_distance(0.04),
+                    session_name=session_a.name,
+                    message_id=20,
+                    message_created_at="2026-01-01T07:00:00Z",
+                ),
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+        )
+        await db_session.commit()
+
+        established_mode("on")
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
+
+        assert metrics.promoted == 1
+        assert metrics.reinforced_established == 1
+        assert metrics.examined == 2
+
+        derived = await self._derived_rows(
+            db_session, test_workspace.name, test_peer.name, observed.name
+        )
+        assert len(derived) == 1
+
+        explicits = await self._explicits(
+            db_session, test_workspace.name, test_peer.name, observed.name
+        )
+        assert len(explicits) == 2
+        assert all(
+            (doc.internal_metadata or {}).get("promotion_examined_at")
+            for doc in explicits
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_session_peers_within_gap_leave_working(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session_a, _session_b = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        await crud.create_documents(
+            db_session,
+            [
+                _explicit(
+                    "Alice likes tea in the morning",
+                    embedding=_axis_embedding(),
+                    session_name=session_a.name,
+                    message_id=10,
+                    message_created_at="2026-01-01T00:00:00Z",
+                ),
+                _explicit(
+                    "Alice drinks tea before work",
+                    embedding=_embedding_at_distance(0.04),
+                    session_name=session_a.name,
+                    message_id=20,
+                    message_created_at="2026-01-01T01:00:00Z",
+                ),
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+        )
+        await db_session.commit()
+
+        established_mode("on")
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
+
+        assert metrics.promoted == 0
+        assert metrics.reinforced_established == 0
+        assert metrics.examined == 2
+        assert (
+            len(
+                await self._derived_rows(
+                    db_session, test_workspace.name, test_peer.name, observed.name
+                )
+            )
+            == 0
+        )
+        explicits = await self._explicits(
+            db_session, test_workspace.name, test_peer.name, observed.name
+        )
+        assert len(explicits) == 2
+        assert all(doc.deleted_at is None for doc in explicits)
 
     @pytest.mark.asyncio
     async def test_existing_established_reinforces_not_second_mint(
@@ -333,9 +444,7 @@ class TestPromoteEstablished:
         await db_session.commit()
 
         established_mode("on")
-        metrics = await run_promotion_cycle(
-            batch_size=50, confirmer=NeverConfirmer()
-        )
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
 
         assert metrics.promoted == 0
         assert metrics.reinforced_established == 1
@@ -387,16 +496,17 @@ class TestPromoteEstablished:
         )
         await db_session.commit()
 
-        metrics = await run_promotion_cycle(
-            batch_size=50, confirmer=NeverConfirmer()
-        )
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
         assert metrics.examined == 0
         assert metrics.promoted == 0
-        assert len(
-            await self._derived_rows(
-                db_session, test_workspace.name, test_peer.name, observed.name
+        assert (
+            len(
+                await self._derived_rows(
+                    db_session, test_workspace.name, test_peer.name, observed.name
+                )
             )
-        ) == 0
+            == 0
+        )
         assert await has_pending_promotion_work(db_session) is True
 
     @pytest.mark.asyncio
@@ -436,17 +546,18 @@ class TestPromoteEstablished:
         await db_session.commit()
 
         established_mode("shadow")
-        metrics = await run_promotion_cycle(
-            batch_size=50, confirmer=NeverConfirmer()
-        )
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
 
         assert "Promote" in metrics.shadow_verdicts
         assert metrics.promoted >= 1
-        assert len(
-            await self._derived_rows(
-                db_session, test_workspace.name, test_peer.name, observed.name
+        assert (
+            len(
+                await self._derived_rows(
+                    db_session, test_workspace.name, test_peer.name, observed.name
+                )
             )
-        ) == 0
+            == 0
+        )
         explicits = await self._explicits(
             db_session, test_workspace.name, test_peer.name, observed.name
         )

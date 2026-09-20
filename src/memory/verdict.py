@@ -106,16 +106,12 @@ def decide_established(
         n for n in neighbours if classify_distance(n.distance) is Band.CANDIDATE
     ]
 
-    same_claim = _nearest_confirmed(
-        candidates, confirmations, ConfirmAnswer.SAME_CLAIM
-    )
+    same_claim = _nearest_confirmed(candidates, confirmations, ConfirmAnswer.SAME_CLAIM)
     if same_claim is not None:
         _proof, neighbour = same_claim
         return Reinforce(target_id=neighbour.id, evidence=evidence)
 
-    unconfirmed = [
-        n for n in candidates if confirmations.for_neighbour(n.id) is None
-    ]
+    unconfirmed = [n for n in candidates if confirmations.for_neighbour(n.id) is None]
     if unconfirmed:
         return NeedsConfirm(candidates=(unconfirmed[0],))
 
@@ -148,12 +144,18 @@ def decide_promotion(
     """Pure promotion verdict. Peers with SAME_SUBJECT_NEW_VALUE never count."""
 
     # 1. Reinforce an existing established same-claim neighbour.
+    # Write-time owns supersede; a confirmed new value stays Leave.
     for n in established:
         if classify_distance(n.distance) is Band.SAME_CLAIM:
             return Reinforce(target_id=n.id, evidence=seed.evidence)
         confirmed = confirmations.for_neighbour(n.id)
         if confirmed is not None and confirmed.answer is ConfirmAnswer.SAME_CLAIM:
             return Reinforce(target_id=n.id, evidence=seed.evidence)
+        if (
+            confirmed is not None
+            and confirmed.answer is ConfirmAnswer.SAME_SUBJECT_NEW_VALUE
+        ):
+            return Leave(reason="unrelated")
 
     # 2. NeedsConfirm for nearest unconfirmed candidate-band neighbour.
     pool = [
