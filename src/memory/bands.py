@@ -6,11 +6,16 @@ Widening them is a product decision, not a deployment knob.
 from __future__ import annotations
 
 import math
+from datetime import timedelta
 from enum import Enum
 from typing import Final
 
 SAME_CLAIM_MAX: Final[float] = 0.05
 CANDIDATE_MAX: Final[float] = 0.15
+
+# Rank demotion for get_most_derived: score *= 0.5^(age / half_life).
+# Product constant, not a deployment knob (Candidate A).
+DECAY_HALF_LIFE: Final[timedelta] = timedelta(days=14)
 
 
 class Band(Enum):

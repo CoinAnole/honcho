@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, exceptions, models, schemas
 from src.config import settings
+from src.crud.document import _most_derived_order_by
 from src.dependencies import tracked_db
 from src.dreamer.dream_scheduler import check_and_schedule_dream
 from src.embedding_client import EmbeddingTokenLimitError, embedding_client
@@ -497,7 +498,18 @@ class RepresentationManager:
     async def _query_documents_most_derived(
         self, db: AsyncSession, top_k: int, session_allowlist: list[str] | None = None
     ) -> list[models.Document]:
-        """Query most derived documents."""
+        """Query most derived documents (half-life demotion; fade, never delete)."""
+        if session_allowlist is None:
+            documents = await crud.query_documents_most_derived(
+                db,
+                self.workspace_name,
+                observer=self.observer,
+                observed=self.observed,
+                limit=top_k,
+            )
+            db.expunge_all()
+            return list(documents)
+
         stmt = (
             select(models.Document)
             .limit(top_k)
@@ -506,24 +518,12 @@ class RepresentationManager:
                 models.Document.observer == self.observer,
                 models.Document.observed == self.observed,
                 models.Document.deleted_at.is_(None),
-                *(
-                    [
-                        models.Document.session_name.in_(session_allowlist),
-                        # Only levels with a trustworthy session stamp are
-                        # scopeable — see ALLOWLIST_SAFE_LEVELS.
-                        models.Document.level.in_(ALLOWLIST_SAFE_LEVELS),
-                    ]
-                    if session_allowlist is not None
-                    else []
-                ),
+                models.Document.session_name.in_(session_allowlist),
+                # Only levels with a trustworthy session stamp are
+                # scopeable — see ALLOWLIST_SAFE_LEVELS.
+                models.Document.level.in_(ALLOWLIST_SAFE_LEVELS),
             )
-            .order_by(
-                models.Document.times_derived.desc(),
-                models.Document.created_at.desc(),
-                # created_at is the transaction timestamp, so documents created
-                # in the same batch share it -- id keeps the order deterministic.
-                models.Document.id,
-            )
+            .order_by(*_most_derived_order_by())
         )
 
         result = await db.execute(stmt)

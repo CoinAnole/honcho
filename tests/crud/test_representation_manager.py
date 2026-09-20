@@ -227,14 +227,20 @@ class TestRepresentationManagerSoftDelete:
     ):
         """Regression: when times_derived ties, the manager's most-derived query
         must fall back to recency, not insertion order. Mirrors the equivalent
-        test on crud.query_documents_most_derived -- the query is duplicated in
-        both modules and must not drift."""
+        test on crud.query_documents_most_derived -- both paths share
+        _most_derived_order_by (and the no-allowlist path calls the crud
+        helper) so they must not drift.
+
+        Timestamps are relative to now so decay demotion does not swamp the
+        times_derived primary term under the default 14-day half-life.
+        """
         test_workspace, test_peer = sample_data
         test_peer2, test_session, _, manager = await self._setup(
             db_session, test_workspace, test_peer
         )
 
-        base = datetime(2026, 1, 1, tzinfo=UTC)
+        now = datetime.now(UTC)
+        base = now - timedelta(days=3)
         # Three conclusions, all reinforced once, inserted oldest-first.
         for i in range(3):
             db_session.add(

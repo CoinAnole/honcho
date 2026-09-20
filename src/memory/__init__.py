@@ -10,6 +10,7 @@ from typing import Any
 
 from src.memory.bands import (
     CANDIDATE_MAX,
+    DECAY_HALF_LIFE,
     SAME_CLAIM_MAX,
     Band,
     classify_distance,
@@ -18,6 +19,7 @@ from src.memory.bands import (
 __all__ = [
     "SAME_CLAIM_MAX",
     "CANDIDATE_MAX",
+    "DECAY_HALF_LIFE",
     "Band",
     "classify_distance",
     "EvidenceKey",

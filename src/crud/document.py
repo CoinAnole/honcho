@@ -25,7 +25,7 @@ from src.exceptions import (
     ValidationException,
     VectorStoreError,
 )
-from src.memory.bands import SAME_CLAIM_MAX
+from src.memory.bands import DECAY_HALF_LIFE, SAME_CLAIM_MAX
 from src.utils.filter import apply_filter
 from src.utils.types import DocumentLevel
 from src.vector_store import (
@@ -183,6 +183,36 @@ async def query_documents_recent(
     return result.scalars().all()
 
 
+def _most_derived_order_by(
+    half_life: datetime.timedelta = DECAY_HALF_LIFE,
+) -> tuple[Any, ...]:
+    """ORDER BY clauses for half-life rank demotion (fade, never delete).
+
+    ``times_derived * 0.5 ^ (age_seconds / half_life_seconds)``, then
+    ``created_at DESC``, then ``id``. Age uses
+    ``coalesce(last_reinforced_at, created_at)``.
+    """
+    half_life_seconds = half_life.total_seconds()
+    age_seconds = func.extract(
+        "epoch",
+        func.now()
+        - func.coalesce(
+            models.Document.last_reinforced_at,
+            models.Document.created_at,
+        ),
+    )
+    decayed_score = models.Document.times_derived * func.power(
+        0.5, age_seconds / half_life_seconds
+    )
+    return (
+        decayed_score.desc(),
+        models.Document.created_at.desc(),
+        # created_at is the transaction timestamp, so documents created in
+        # the same batch share it -- id keeps the order deterministic.
+        models.Document.id,
+    )
+
+
 async def query_documents_most_derived(
     db: AsyncSession,
     workspace_name: str,
@@ -190,9 +220,16 @@ async def query_documents_most_derived(
     observer: str,
     observed: str,
     limit: int = 10,
+    half_life: datetime.timedelta = DECAY_HALF_LIFE,
 ) -> Sequence[models.Document]:
-    """
-    Query documents sorted by times_derived (most reinforced first).
+    """Query documents by decayed reinforcement score (fade, never delete).
+
+    Ranks by ``times_derived * 0.5^(age / half_life)`` where age is
+    ``now - coalesce(last_reinforced_at, created_at)``. Soft-deleted rows
+    stay excluded. Derived rows feel decay in practice because only they get
+    ``last_reinforced_at`` from the established path; working rows with NULL
+    ``last_reinforced_at`` decay from ``created_at``, which is the existing
+    newest-first tiebreak in disguise.
 
     Args:
         db: Database session
@@ -200,9 +237,10 @@ async def query_documents_most_derived(
         observer: Name of the observing peer
         observed: Name of the observed peer
         limit: Maximum number of documents to return
+        half_life: Decay half-life (default 14 days)
 
     Returns:
-        Sequence of documents ordered by times_derived descending,
+        Sequence of documents ordered by decayed score descending,
         ties broken by created_at descending (most recent first)
     """
     stmt = (
@@ -213,13 +251,7 @@ async def query_documents_most_derived(
             models.Document.observed == observed,
             models.Document.deleted_at.is_(None),
         )
-        .order_by(
-            models.Document.times_derived.desc(),
-            models.Document.created_at.desc(),
-            # created_at is the transaction timestamp, so documents created in
-            # the same batch share it -- id keeps the order deterministic.
-            models.Document.id,
-        )
+        .order_by(*_most_derived_order_by(half_life))
         .limit(limit)
     )
 
