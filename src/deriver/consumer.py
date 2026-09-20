@@ -15,9 +15,12 @@ from src.deriver.scope_backfill import (
 from src.dreamer import process_dream
 from src.exceptions import ResourceNotFoundException, ValidationException
 from src.models import Message
+from src.config import settings
+from src.memory.confirm import confirmer_from_settings
 from src.reconciler.backfill_document_sources import (
     run_document_sources_backfill_cycle,
 )
+from src.reconciler.promote_established import run_promotion_cycle
 from src.reconciler.queue_cleanup import cleanup_queue_items
 from src.reconciler.sync_vectors import run_vector_reconciliation_cycle
 from src.schemas import ReconcilerType, ResolvedConfiguration
@@ -450,6 +453,31 @@ async def process_reconciler(payload: ReconcilerPayload) -> None:
     elif reconciler_type == ReconcilerType.BACKFILL_DOCUMENT_SOURCES:
         logger.debug("Processing backfill_document_sources task")
         await run_document_sources_backfill_cycle()
+
+    elif reconciler_type == ReconcilerType.PROMOTE_ESTABLISHED:
+        logger.debug("Processing promote_established task")
+        metrics = await run_promotion_cycle(
+            batch_size=settings.ESTABLISHED.PROMOTION_BATCH_SIZE,
+            confirmer=confirmer_from_settings(settings.ESTABLISHED),
+        )
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        if (
+            metrics.examined > 0
+            or metrics.promoted > 0
+            or metrics.reinforced_established > 0
+            or metrics.shadow_verdicts
+        ):
+            logger.info(
+                "Promotion cycle complete: examined=%s promoted=%s reinforced=%s "
+                "undecided=%s left_working=%s dream_hints=%s duration_ms=%.1f",
+                metrics.examined,
+                metrics.promoted,
+                metrics.reinforced_established,
+                metrics.undecided,
+                metrics.left_working,
+                metrics.dream_hints,
+                duration_ms,
+            )
 
     else:
         raise ValueError(f"Unsupported reconciler type: {reconciler_type}")

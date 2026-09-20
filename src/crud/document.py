@@ -261,6 +261,7 @@ class NeighbourScope:
 
     levels: frozenset[DocumentLevel]
     session_name: str | None = None
+    exclude_session_name: str | None = None
 
     @staticmethod
     def working(doc: schemas.DocumentCreate) -> "NeighbourScope | None":
@@ -280,6 +281,14 @@ class NeighbourScope:
         """Live derived rows. contradiction is excluded."""
         return NeighbourScope(levels=frozenset({"inductive", "deductive"}))
 
+    @staticmethod
+    def working_cross_session(*, exclude_session: str) -> "NeighbourScope":
+        """Live explicit rows in other sessions — promotion evidence only."""
+        return NeighbourScope(
+            levels=frozenset({"explicit"}),
+            exclude_session_name=exclude_session,
+        )
+
     def filters(self) -> dict[str, Any]:
         """Filter dict for apply_filter and the external vector store."""
         if len(self.levels) == 1:
@@ -287,7 +296,11 @@ class NeighbourScope:
         else:
             level_filter = {"in": sorted(self.levels)}
         out: dict[str, Any] = {"level": level_filter}
-        if self.session_name is not None:
+        if self.exclude_session_name is not None:
+            # apply_filter supports ``ne``; external stores may not — see
+            # find_neighbours post-filter for that path.
+            out["session_name"] = {"ne": self.exclude_session_name}
+        elif self.session_name is not None:
             out["session_name"] = self.session_name
         return out
 
@@ -300,6 +313,23 @@ def _neighbour_from_document(doc: models.Document, distance: float) -> Neighbour
         session_name=doc.session_name,
         content=doc.content,
     )
+
+
+def _external_filters_without_ne(
+    filters: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Strip ``session_name: {ne: ...}`` for stores that only speak Eq/In.
+
+    Returns (filters_for_store, exclude_session). Caller post-filters hits.
+    """
+    session_filter = filters.get("session_name")
+    if not isinstance(session_filter, dict) or "ne" not in session_filter:
+        return filters, None
+    exclude = session_filter["ne"]
+    if not isinstance(exclude, str):
+        return filters, None
+    stripped = {k: v for k, v in filters.items() if k != "session_name"}
+    return stripped, exclude
 
 
 async def find_neighbours(
@@ -342,14 +372,18 @@ async def find_neighbours(
             _neighbour_from_document(doc, distance) for doc, distance in result.all()
         ]
 
+    store_filters, exclude_session = _external_filters_without_ne(filters)
+    # Over-fetch when post-filtering exclude_session so Eq/In-only stores still
+    # have enough candidates after dropping the excluded session.
+    fetch_k = top_k * 4 if exclude_session is not None else top_k
     hits = await _query_external_vector_hits(
         workspace_name,
         observer,
         observed,
         embedding,
-        top_k=top_k,
+        top_k=fetch_k,
         max_distance=max_distance,
-        filters=filters,
+        filters=store_filters,
     )
     if not hits:
         return []
@@ -360,14 +394,18 @@ async def find_neighbours(
         observer=observer,
         observed=observed,
         document_ids=[hit_id for hit_id, _ in hits],
-        filters=filters,
+        filters=store_filters if exclude_session is None else filters,
     )
     score_by_id = {hit_id: score for hit_id, score in hits}
-    return [
+    neighbours = [
         _neighbour_from_document(doc, score_by_id[doc.id])
         for doc in documents
         if doc.id in score_by_id
     ]
+    if exclude_session is not None:
+        neighbours = [n for n in neighbours if n.session_name != exclude_session]
+    neighbours.sort(key=lambda n: n.distance)
+    return neighbours[:top_k]
 
 
 async def _query_external_vector_hits(

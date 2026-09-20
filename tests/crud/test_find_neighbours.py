@@ -287,6 +287,61 @@ class TestFindNeighbours:
         )
         assert NeighbourScope.working(doc) is None
 
+    def test_working_cross_session_filters_emit_ne(self):
+        scope = NeighbourScope.working_cross_session(exclude_session="sess-a")
+        assert scope.levels == frozenset({"explicit"})
+        assert scope.filters() == {
+            "level": "explicit",
+            "session_name": {"ne": "sess-a"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_working_cross_session_excludes_seed_session(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        test_workspace, test_peer = sample_data
+        observed, session_a, session_b = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        await self._create(
+            db_session,
+            [
+                self._doc(
+                    "same session",
+                    embedding=_embedding_at_distance(0.01),
+                    session_name=session_a.name,
+                ),
+                self._doc(
+                    "other session",
+                    embedding=_embedding_at_distance(0.02),
+                    session_name=session_b.name,
+                    message_id=2,
+                ),
+            ],
+            test_workspace.name,
+            test_peer.name,
+            observed.name,
+        )
+
+        neighbours = await find_neighbours(
+            db_session,
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            embedding=_axis_embedding(),
+            scope=NeighbourScope.working_cross_session(
+                exclude_session=session_a.name
+            ),
+            max_distance=CANDIDATE_MAX,
+            top_k=5,
+        )
+
+        contents = await self._contents_by_id(db_session, [n.id for n in neighbours])
+        assert contents == ["other session"]
+
     @pytest.mark.asyncio
     async def test_soft_deleted_excluded(
         self,

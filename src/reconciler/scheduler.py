@@ -24,6 +24,7 @@ from src.models import QueueItem
 from src.reconciler.backfill_document_sources import (
     has_pending_document_sources,
 )
+from src.reconciler.promote_established import has_pending_promotion_work
 from src.reconciler.sync_vectors import (
     has_pending_work,
     record_pending_embeddings_backlog,
@@ -59,6 +60,11 @@ RECONCILER_TASKS: dict[str, ReconcilerTask] = {
         name="backfill_document_sources",
         work_unit_key="reconciler:backfill_document_sources",
         interval_seconds=settings.VECTOR_STORE.RECONCILIATION_INTERVAL_SECONDS,
+    ),
+    "promote_established": ReconcilerTask(
+        name="promote_established",
+        work_unit_key="reconciler:promote_established",
+        interval_seconds=settings.ESTABLISHED.PROMOTION_INTERVAL_SECONDS,
     ),
 }
 
@@ -275,6 +281,18 @@ class ReconcilerScheduler:
             ):
                 logger.debug("Task %s has nothing to do, skipping enqueue", task.name)
                 return False
+
+            if task.name == "promote_established":
+                if settings.ESTABLISHED.MODE == "off":
+                    logger.debug(
+                        "Task %s skipped: ESTABLISHED.MODE=off", task.name
+                    )
+                    return False
+                if not await has_pending_promotion_work(db):
+                    logger.debug(
+                        "Task %s has nothing to do, skipping enqueue", task.name
+                    )
+                    return False
 
             # Enqueue the task using ORM
             queue_item = QueueItem(
