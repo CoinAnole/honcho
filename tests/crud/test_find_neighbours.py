@@ -332,15 +332,83 @@ class TestFindNeighbours:
             observer=test_peer.name,
             observed=observed.name,
             embedding=_axis_embedding(),
-            scope=NeighbourScope.working_cross_session(
-                exclude_session=session_a.name
-            ),
+            scope=NeighbourScope.working_cross_session(exclude_session=session_a.name),
             max_distance=CANDIDATE_MAX,
             top_k=5,
         )
 
         contents = await self._contents_by_id(db_session, [n.id for n in neighbours])
         assert contents == ["other session"]
+
+    def test_working_peers_filters_emit_id_ne(self):
+        scope = NeighbourScope.working_peers(exclude_id="seed-1")
+        assert scope.levels == frozenset({"explicit"})
+        assert scope.filters() == {
+            "level": "explicit",
+            "id": {"ne": "seed-1"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_working_peers_excludes_seed_id(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        test_workspace, test_peer = sample_data
+        observed, session_a, session_b = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        await self._create(
+            db_session,
+            [
+                self._doc(
+                    "seed row",
+                    embedding=_axis_embedding(),
+                    session_name=session_a.name,
+                ),
+                self._doc(
+                    "same session peer",
+                    embedding=_embedding_at_distance(0.04),
+                    session_name=session_a.name,
+                    message_id=2,
+                ),
+                self._doc(
+                    "other session",
+                    embedding=_embedding_at_distance(0.02),
+                    session_name=session_b.name,
+                    message_id=3,
+                ),
+            ],
+            test_workspace.name,
+            test_peer.name,
+            observed.name,
+        )
+
+        result = await db_session.execute(
+            select(models.Document).where(
+                models.Document.workspace_name == test_workspace.name,
+                models.Document.observer == test_peer.name,
+                models.Document.observed == observed.name,
+            )
+        )
+        docs = {doc.content: doc for doc in result.scalars().all()}
+        seed = docs["seed row"]
+
+        neighbours = await find_neighbours(
+            db_session,
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            embedding=_axis_embedding(),
+            scope=NeighbourScope.working_peers(exclude_id=seed.id),
+            max_distance=CANDIDATE_MAX,
+            top_k=5,
+        )
+
+        assert seed.id not in [n.id for n in neighbours]
+        contents = await self._contents_by_id(db_session, [n.id for n in neighbours])
+        assert contents == ["other session", "same session peer"]
 
     @pytest.mark.asyncio
     async def test_soft_deleted_excluded(

@@ -129,9 +129,7 @@ class TestDecideEstablished:
         assert v.proof.answer is ConfirmAnswer.SAME_SUBJECT_NEW_VALUE
 
     def test_undecided_leaves(self):
-        conf = Confirmations.from_answers(
-            [("n1", ConfirmAnswer.UNDECIDED, None, 0.09)]
-        )
+        conf = Confirmations.from_answers([("n1", ConfirmAnswer.UNDECIDED, None, 0.09)])
         v = decide_established(
             new=_doc(),
             neighbours=[_n("n1", 0.09)],
@@ -141,9 +139,7 @@ class TestDecideEstablished:
         assert v.reason == "undecided"
 
     def test_unrelated_leaves(self):
-        conf = Confirmations.from_answers(
-            [("n1", ConfirmAnswer.UNRELATED, None, 0.09)]
-        )
+        conf = Confirmations.from_answers([("n1", ConfirmAnswer.UNRELATED, None, 0.09)])
         v = decide_established(
             new=_doc(),
             neighbours=[_n("n1", 0.09)],
@@ -235,6 +231,24 @@ class TestDecidePromotion:
             },
         )
         assert isinstance(v, Leave)
+
+    def test_established_new_value_leaves_despite_same_claim_peer(self):
+        peer = _n("peer", 0.04, session_name="sess-b", level="explicit")
+        conf = Confirmations.from_answers(
+            [("est", ConfirmAnswer.SAME_SUBJECT_NEW_VALUE, None, 0.09)]
+        )
+        v = decide_promotion(
+            seed=_seed(),
+            established=[_n("est", 0.09)],
+            peers=[peer],
+            confirmations=conf,
+            peer_evidence={"peer": EvidenceKey("sess-b:2-2")},
+            peer_conversations={
+                "peer": Conversation("sess-b", _T0 + timedelta(hours=7))
+            },
+        )
+        assert isinstance(v, Leave)
+        assert v.reason == "unrelated"
 
     def test_same_session_within_gap_does_not_promote(self):
         peer = _n("peer", 0.04, session_name="sess-a", level="explicit")

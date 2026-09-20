@@ -294,6 +294,7 @@ class NeighbourScope:
     levels: frozenset[DocumentLevel]
     session_name: str | None = None
     exclude_session_name: str | None = None
+    exclude_id: str | None = None
 
     @staticmethod
     def working(doc: schemas.DocumentCreate) -> "NeighbourScope | None":
@@ -321,6 +322,14 @@ class NeighbourScope:
             exclude_session_name=exclude_session,
         )
 
+    @staticmethod
+    def working_peers(*, exclude_id: str) -> "NeighbourScope":
+        """Live explicit rows other than the seed."""
+        return NeighbourScope(
+            levels=frozenset({"explicit"}),
+            exclude_id=exclude_id,
+        )
+
     def filters(self) -> dict[str, Any]:
         """Filter dict for apply_filter and the external vector store."""
         if len(self.levels) == 1:
@@ -334,6 +343,8 @@ class NeighbourScope:
             out["session_name"] = {"ne": self.exclude_session_name}
         elif self.session_name is not None:
             out["session_name"] = self.session_name
+        if self.exclude_id is not None:
+            out["id"] = {"ne": self.exclude_id}
         return out
 
 
@@ -349,19 +360,19 @@ def _neighbour_from_document(doc: models.Document, distance: float) -> Neighbour
 
 def _external_filters_without_ne(
     filters: dict[str, Any],
-) -> tuple[dict[str, Any], str | None]:
-    """Strip ``session_name: {ne: ...}`` for stores that only speak Eq/In.
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Strip ``{ne: ...}`` filters for stores that only speak Eq/In.
 
-    Returns (filters_for_store, exclude_session). Caller post-filters hits.
+    Returns (filters_for_store, excluded_values). Caller post-filters hits.
     """
-    session_filter = filters.get("session_name")
-    if not isinstance(session_filter, dict) or "ne" not in session_filter:
-        return filters, None
-    exclude = session_filter["ne"]
-    if not isinstance(exclude, str):
-        return filters, None
-    stripped = {k: v for k, v in filters.items() if k != "session_name"}
-    return stripped, exclude
+    store: dict[str, Any] = {}
+    excluded: dict[str, Any] = {}
+    for key, value in filters.items():
+        if isinstance(value, dict) and "ne" in value:
+            excluded[key] = value["ne"]
+        else:
+            store[key] = value
+    return store, excluded
 
 
 async def find_neighbours(
@@ -404,10 +415,10 @@ async def find_neighbours(
             _neighbour_from_document(doc, distance) for doc, distance in result.all()
         ]
 
-    store_filters, exclude_session = _external_filters_without_ne(filters)
-    # Over-fetch when post-filtering exclude_session so Eq/In-only stores still
-    # have enough candidates after dropping the excluded session.
-    fetch_k = top_k * 4 if exclude_session is not None else top_k
+    store_filters, excluded = _external_filters_without_ne(filters)
+    # Over-fetch when post-filtering ``ne`` so Eq/In-only stores still have
+    # enough candidates after dropping the seed id or excluded session.
+    fetch_k = top_k * 4 if excluded else top_k
     hits = await _query_external_vector_hits(
         workspace_name,
         observer,
@@ -426,7 +437,7 @@ async def find_neighbours(
         observer=observer,
         observed=observed,
         document_ids=[hit_id for hit_id, _ in hits],
-        filters=store_filters if exclude_session is None else filters,
+        filters=store_filters if not excluded else filters,
     )
     score_by_id = {hit_id: score for hit_id, score in hits}
     neighbours = [
@@ -434,8 +445,12 @@ async def find_neighbours(
         for doc in documents
         if doc.id in score_by_id
     ]
+    exclude_session = excluded.get("session_name")
+    exclude_id = excluded.get("id")
     if exclude_session is not None:
         neighbours = [n for n in neighbours if n.session_name != exclude_session]
+    if exclude_id is not None:
+        neighbours = [n for n in neighbours if n.id != exclude_id]
     neighbours.sort(key=lambda n: n.distance)
     return neighbours[:top_k]
 
@@ -829,6 +844,7 @@ async def create_documents(
                 evidence=evidence,
             )
         )
+
     # Resolve external-store dup candidates before the first DB statement.
     # None = pgvector in-place fallback; [] = skip semantic (no external I/O under db).
     semantic_candidates: list[list[str] | None] = [None] * len(documents)
@@ -1159,11 +1175,7 @@ async def create_documents(
 
     established_result = EstablishedPassResult()
     mode = settings.ESTABLISHED.MODE
-    if (
-        _established_pass
-        and mode != "off"
-        and established_snapshots
-    ):
+    if _established_pass and mode != "off" and established_snapshots:
         try:
             from src.crud.established import run_established_pass
             from src.memory.confirm import confirmer_from_settings
@@ -1740,6 +1752,7 @@ async def _apply_document_row_updates(
         row.times_derived = max(row.times_derived + 1, op.incoming_times_derived)
     await db.flush()
     return fallbacks
+
 
 class SemanticRejectionResult(Enum):
     NOT_DUPLICATE = 0
