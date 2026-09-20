@@ -407,6 +407,9 @@ class Document(Base):
     deleted_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True, default=None
     )
+    last_reinforced_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
 
     # Vector sync state tracking
     sync_state: Mapped[VectorSyncState] = mapped_column(
@@ -532,6 +535,25 @@ class Document(Base):
                 "source_ids IS NOT NULL OR internal_metadata ?| ARRAY['source_ids', 'premise_ids']"  # noqa: E501
             ),
         ),
+    )
+
+
+@final
+class EstablishedEvidence(Base):
+    """Uniqueness ledger: this evidence digest already counted on an established row.
+
+    Reinforce with an evidence_key inserts here ON CONFLICT DO NOTHING; a
+    conflict means the reinforce is a retry no-op (no times_derived bump).
+    """
+
+    __tablename__: str = "established_evidence"
+
+    established_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    evidence_digest: Mapped[str] = mapped_column(TEXT, primary_key=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 

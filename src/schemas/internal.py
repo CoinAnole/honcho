@@ -58,6 +58,10 @@ class DocumentMetadata(BaseModel):
         default=None,
         description="Confidence level (high, medium, low) -- only applicable for inductive documents",
     )
+    evidence: list[str] | None = Field(
+        default=None,
+        description="Evidence digests already counted on this established row (session:min-max)",
+    )
 
 
 class DocumentCreate(DocumentBase):

@@ -248,6 +248,7 @@ class Neighbour:
     distance: float
     level: DocumentLevel
     session_name: str | None = None
+    content: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +298,7 @@ def _neighbour_from_document(doc: models.Document, distance: float) -> Neighbour
         distance=float(distance),
         level=doc.level,
         session_name=doc.session_name,
+        content=doc.content,
     )
 
 
@@ -658,12 +660,25 @@ def _dedup_key(
 
 @dataclass(frozen=True, slots=True)
 class _DocumentRowOp:
-    kind: Literal["reinforce", "replace"]
+    kind: Literal["reinforce", "replace", "supersede"]
     document_id: str
     incoming_times_derived: int = 1
     # When a reinforce skipped insert and the locked target is gone/deleted,
     # insert this document instead of dropping it.
     fallback_document: schemas.DocumentCreate | None = None
+    # Established reinforce: skip times_derived bump when digest already in ledger.
+    evidence_key: str | None = None
+    # Supersede: soft-delete document_id; link to this winner.
+    winner_id: str | None = None
+
+
+@dataclass
+class EstablishedPassResult:
+    reinforced: list[str] = field(default_factory=list)
+    superseded: list[tuple[str, str]] = field(default_factory=list)
+    left_working: int = 0
+    awaiting_confirm_undecided: int = 0
+    shadow_verdicts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -673,6 +688,7 @@ class CreateDocumentsResult:
     exact_dup_existing_count: int = 0
     semantic_dup_rejected_count: int = 0
     semantic_dup_replaced_count: int = 0
+    established: EstablishedPassResult = field(default_factory=EstablishedPassResult)
 
 
 async def create_documents(
@@ -683,6 +699,7 @@ async def create_documents(
     observer: str,
     observed: str,
     deduplicate: bool = False,
+    _established_pass: bool = True,
 ) -> CreateDocumentsResult:
     """
     Create multiple documents with optional duplicate detection.
@@ -691,6 +708,12 @@ async def create_documents(
     dedup via ``is_rejected_duplicate`` for documents that survive the exact
     deduplication check.
 
+    After the working-layer commit (and vector upsert), when
+    ``settings.ESTABLISHED.MODE != "off"`` and ``_established_pass`` is True,
+    accepted explicit evidence snapshots are handed to
+    ``run_established_pass`` (own short sessions; ``db`` is not held across
+    confirm). Mint paths pass ``_established_pass=False``.
+
     Args:
         db: Database session
         documents: List of document creation schemas
@@ -698,16 +721,44 @@ async def create_documents(
         observer: Name of the observing peer
         observed: Name of the observed peer
         deduplicate: Enable semantic duplicate detection
+        _established_pass: Internal; False disables the post-commit established pass
 
     Returns:
-        List of DocumentCreate schemas that were actually inserted (excludes
-        duplicates and failures).
+        CreateDocumentsResult with inserted documents and optional established
+        pass counts.
     """
+    from src.memory.evidence import evidence_key_from_document
+
     honcho_documents: list[models.Document] = []
     accepted_documents: list[schemas.DocumentCreate] = []
     # Store (document_model, embedding) pairs - IDs aren't available until after commit
     docs_with_embeddings: list[tuple[models.Document, list[float]]] = []
+    # Explicit evidence for the established pass (inserts + reinforce restatements).
+    established_snapshots: list[Any] = []
 
+    def _maybe_snapshot_explicit(
+        *,
+        document_id: str,
+        doc: schemas.DocumentCreate,
+    ) -> None:
+        if doc.level != "explicit" or not doc.embedding or doc.session_name is None:
+            return
+        evidence = evidence_key_from_document(doc)
+        if evidence is None:
+            return
+        from src.crud.established import _AcceptedExplicit
+
+        established_snapshots.append(
+            _AcceptedExplicit(
+                id=document_id,
+                content=doc.content,
+                embedding=doc.embedding,
+                session_name=doc.session_name,
+                message_ids=tuple(doc.metadata.message_ids),
+                message_created_at=doc.metadata.message_created_at,
+                evidence=evidence,
+            )
+        )
     # Resolve external-store dup candidates before the first DB statement.
     # None = pgvector in-place fallback; [] = skip semantic (no external I/O under db).
     semantic_candidates: list[list[str] | None] = [None] * len(documents)
@@ -845,6 +896,8 @@ async def create_documents(
                     )
                 )
                 exact_dup_existing_count += 1
+                # Rejected restatement is still evidence for the established pass.
+                _maybe_snapshot_explicit(document_id=existing_match.id, doc=doc)
                 continue
 
             if deduplicate:
@@ -886,6 +939,7 @@ async def create_documents(
                         )
                     )
                     semantic_dup_rejected_count += 1
+                    _maybe_snapshot_explicit(document_id=existing_dup.id, doc=doc)
                     continue
 
             new_doc = _document_model_from_create(
@@ -895,7 +949,7 @@ async def create_documents(
             accepted_documents.append(doc)
             if doc.embedding:
                 docs_with_embeddings.append((new_doc, doc.embedding))
-
+            _maybe_snapshot_explicit(document_id=new_doc.id, doc=doc)
         except IntegrityError as e:
             await db.rollback()
             raise ValidationException(
@@ -931,6 +985,7 @@ async def create_documents(
             accepted_documents.append(fallback_doc)
             if fallback_doc.embedding:
                 docs_with_embeddings.append((new_doc, fallback_doc.embedding))
+            _maybe_snapshot_explicit(document_id=new_doc.id, doc=fallback_doc)
         db.add_all(honcho_documents)
         # NOTE
         # If the process crashes after this commit but before vector upsert completes,
@@ -1032,12 +1087,40 @@ async def create_documents(
         await db.rollback()
         raise
 
+    established_result = EstablishedPassResult()
+    mode = settings.ESTABLISHED.MODE
+    if (
+        _established_pass
+        and mode != "off"
+        and established_snapshots
+    ):
+        try:
+            from src.crud.established import run_established_pass
+            from src.memory.confirm import confirmer_from_settings
+
+            established_result = await run_established_pass(
+                established_snapshots,
+                workspace_name=workspace_name,
+                observer=observer,
+                observed=observed,
+                confirmer=confirmer_from_settings(settings.ESTABLISHED),
+                mode=cast(Literal["shadow", "on"], mode),
+            )
+        except Exception:
+            logger.exception(
+                "Established pass failed for %s/%s/%s; leaving working rows",
+                workspace_name,
+                observer,
+                observed,
+            )
+
     return CreateDocumentsResult(
         created_documents=accepted_documents,
         exact_dup_existing_count=exact_dup_existing_count,
         exact_dup_in_batch_count=exact_dup_in_batch_count,
         semantic_dup_rejected_count=semantic_dup_rejected_count,
         semantic_dup_replaced_count=semantic_dup_replaced_count,
+        established=established_result,
     )
 
 
@@ -1415,6 +1498,8 @@ def _document_model_from_create(
     observer: str,
     observed: str,
 ) -> models.Document:
+    from nanoid import generate as generate_nanoid
+
     metadata_dict = doc.metadata.model_dump(exclude_none=True)
     store_embeddings_in_postgres = (
         settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
@@ -1444,9 +1529,40 @@ def _document_model_from_create(
             session_name=doc.session_name,
             source_links=build_source_links(doc.source_ids, workspace_name),
         )
+    # Assign id before flush so post-commit established snapshots (and vector
+    # upsert bookkeeping) can key on it without waiting for INSERT defaults.
+    if not new_doc.id:
+        new_doc.id = generate_nanoid()
     if doc.embedding:
         new_doc.sync_state = "pending"
     return new_doc
+
+
+async def _insert_established_evidence(
+    db: AsyncSession, *, established_id: str, evidence_digest: str
+) -> bool:
+    """Insert evidence ledger row. True when this digest is new for the row."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    stmt = (
+        pg_insert(models.EstablishedEvidence)
+        .values(established_id=established_id, evidence_digest=evidence_digest)
+        .on_conflict_do_nothing(index_elements=["established_id", "evidence_digest"])
+        .returning(models.EstablishedEvidence.established_id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
+def _metadata_union_list(meta: dict[str, Any], key: str, value: str) -> dict[str, Any]:
+    """Return a shallow-copied metadata dict with value unioned into a list field."""
+    out = dict(meta)
+    current = out.get(key)
+    items = list(current) if isinstance(current, list) else []
+    if value not in items:
+        items.append(value)
+        out[key] = items
+    return out
 
 
 async def _apply_document_row_updates(
@@ -1457,11 +1573,26 @@ async def _apply_document_row_updates(
     observer: str,
     observed: str,
 ) -> list[schemas.DocumentCreate]:
-    """Lock target rows by id, apply ops, return fallbacks for vanished targets."""
+    """Lock target rows by id, apply ops, return fallbacks for vanished targets.
+
+    Reinforce with ``evidence_key``: insert into ``established_evidence``; on
+    conflict the reinforce is a no-op. Otherwise bump ``times_derived`` and set
+    ``last_reinforced_at``. Reinforce without ``evidence_key`` is the working-
+    row path (unchanged). Supersede soft-deletes the loser (idempotent), sets
+    ``superseded_by`` once, and unions the loser into the winner's
+    ``supersedes`` list when the winner is locked in the same txn.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
     if not ops:
         return []
-    # Deadlock fix: lock in id order (IN-clause order is ignored).
-    ids = sorted({op.document_id for op in ops})
+    # Deadlock fix: lock in id order (IN-clause order is ignored). Include winners.
+    ids = sorted(
+        {
+            *(op.document_id for op in ops),
+            *(op.winner_id for op in ops if op.winner_id is not None),
+        }
+    )
     result = await db.execute(
         select(models.Document)
         .where(
@@ -1481,11 +1612,32 @@ async def _apply_document_row_updates(
     stale_at_lock = {
         op.document_id
         for op in ops
-        if (locked_row := locked.get(op.document_id)) is None
-        or locked_row.deleted_at is not None
+        if op.kind != "supersede"
+        and (
+            (locked_row := locked.get(op.document_id)) is None
+            or locked_row.deleted_at is not None
+        )
     }
     for op in ops:
         row = locked.get(op.document_id)
+        if op.kind == "supersede":
+            if row is not None and row.deleted_at is None:
+                row.deleted_at = now
+            if row is not None and op.winner_id is not None:
+                meta = dict(row.internal_metadata or {})
+                if "superseded_by" not in meta:
+                    meta["superseded_by"] = op.winner_id
+                    row.internal_metadata = meta
+                    flag_modified(row, "internal_metadata")
+            winner = locked.get(op.winner_id) if op.winner_id else None
+            if winner is not None:
+                winner.internal_metadata = _metadata_union_list(
+                    dict(winner.internal_metadata or {}),
+                    "supersedes",
+                    op.document_id,
+                )
+                flag_modified(winner, "internal_metadata")
+            continue
         if op.kind == "replace":
             if row is not None and row.deleted_at is None:
                 row.deleted_at = now
@@ -1498,10 +1650,26 @@ async def _apply_document_row_updates(
         if row is None or row.deleted_at is not None:
             # An earlier op in this batch replaced this row.
             continue
+        if op.evidence_key is not None:
+            inserted = await _insert_established_evidence(
+                db,
+                established_id=row.id,
+                evidence_digest=op.evidence_key,
+            )
+            if not inserted:
+                continue
+            row.times_derived = max(row.times_derived + 1, op.incoming_times_derived)
+            row.last_reinforced_at = now
+            row.internal_metadata = _metadata_union_list(
+                dict(row.internal_metadata or {}),
+                "evidence",
+                op.evidence_key,
+            )
+            flag_modified(row, "internal_metadata")
+            continue
         row.times_derived = max(row.times_derived + 1, op.incoming_times_derived)
     await db.flush()
     return fallbacks
-
 
 class SemanticRejectionResult(Enum):
     NOT_DUPLICATE = 0
