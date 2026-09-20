@@ -27,7 +27,7 @@ from src.exceptions import (
 )
 from src.memory.bands import DECAY_HALF_LIFE, SAME_CLAIM_MAX
 from src.utils.filter import apply_filter
-from src.utils.types import DocumentLevel
+from src.utils.types import DocumentLevel, VectorSyncState
 from src.vector_store import (
     VectorRecord,
     VectorStore,
@@ -310,9 +310,12 @@ class NeighbourScope:
         )
 
     @staticmethod
-    def established() -> "NeighbourScope":
-        """Live derived rows. contradiction is excluded."""
-        return NeighbourScope(levels=frozenset({"inductive", "deductive"}))
+    def established(*, exclude_id: str | None = None) -> "NeighbourScope":
+        """Live derived rows. contradiction is excluded. Optional self-exclusion."""
+        return NeighbourScope(
+            levels=frozenset({"inductive", "deductive"}),
+            exclude_id=exclude_id,
+        )
 
     @staticmethod
     def working_cross_session(*, exclude_session: str) -> "NeighbourScope":
@@ -1573,6 +1576,23 @@ async def create_observations(
     return honcho_documents
 
 
+def _initial_sync_state(doc: schemas.DocumentCreate) -> VectorSyncState:
+    """Vector sync state a freshly built row is born with.
+
+    ``sync_state`` answers whether the store that serves ``find_neighbours``
+    can already see this vector. In pgvector mode the row *is* that store, so
+    a row carrying its embedding is synced the instant it is durable. In
+    external-store mode the vector lives elsewhere until ``upsert_many``, so
+    the row is born pending. No upsert and no second commit live here.
+    """
+    store_embeddings_in_postgres = (
+        settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
+    )
+    if store_embeddings_in_postgres and doc.embedding:
+        return "synced"
+    return "pending"
+
+
 def _document_model_from_create(
     doc: schemas.DocumentCreate,
     *,
@@ -1615,8 +1635,7 @@ def _document_model_from_create(
     # upsert bookkeeping) can key on it without waiting for INSERT defaults.
     if not new_doc.id:
         new_doc.id = generate_nanoid()
-    if doc.embedding:
-        new_doc.sync_state = "pending"
+    new_doc.sync_state = _initial_sync_state(doc)
     return new_doc
 
 
