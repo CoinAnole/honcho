@@ -1430,6 +1430,26 @@ class DreamSettings(HonchoSettings):
         return self
 
 
+class EstablishedSettings(HonchoSettings):
+    """Track B established-memory pass and promotion reconciler knobs.
+
+    Distance cutoffs live in ``src.memory.bands`` and are intentionally not
+    settings — widening them is a product decision, not a deployment knob.
+    """
+
+    model_config = SettingsConfigDict(  # pyright: ignore
+        env_prefix="ESTABLISHED_", env_nested_delimiter="__", extra="ignore"
+    )
+
+    MODE: Literal["off", "shadow", "on"] = "off"
+    CANDIDATE_TOP_K: Annotated[int, Field(ge=1, le=16)] = 4
+    CONFIRM_CONCURRENCY: Annotated[int, Field(ge=1, le=16)] = 4
+    CONFIRM_TIMEOUT_SECONDS: float = 8.0
+    CONFIRM_MODEL: ConfiguredModelSettings | None = None
+    PROMOTION_INTERVAL_SECONDS: int = 900
+    PROMOTION_BATCH_SIZE: int = 200
+
+
 class VectorStoreSettings(HonchoSettings):
     """Settings for vector store (pgvector, Turbopuffer, LanceDB or Qdrant)."""
 
@@ -1566,6 +1586,7 @@ class AppSettings(HonchoSettings):
     TELEMETRY: TelemetrySettings = Field(default_factory=TelemetrySettings)
     CACHE: CacheSettings = Field(default_factory=CacheSettings)
     DREAM: DreamSettings = Field(default_factory=DreamSettings)
+    ESTABLISHED: EstablishedSettings = Field(default_factory=EstablishedSettings)
     VECTOR_STORE: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
     TRACE_VIEWER: TraceViewerSettings = Field(default_factory=TraceViewerSettings)
 
