@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import pytest
@@ -12,11 +13,15 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from src import crud, models, schemas
 from src.config import settings
+from src.deriver.consumer import process_reconciler
 from src.memory.confirm import NeverConfirmer
 from src.reconciler.promote_established import (
+    PromotionCycleMetrics,
     has_pending_promotion_work,
     run_promotion_cycle,
 )
+from src.schemas import ReconcilerType
+from src.utils.queue_payload import ReconcilerPayload
 
 _DIM = 1536
 
@@ -450,6 +455,35 @@ class TestPromoteEstablished:
             for doc in explicits
         )
         assert await has_pending_promotion_work(db_session) is True
+
+    @pytest.mark.asyncio
+    async def test_promotion_consumer_logs_shadow_verdict_names(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        async def _cycle(*, batch_size, confirmer):
+            del batch_size, confirmer
+            return PromotionCycleMetrics(
+                examined=1,
+                promoted=1,
+                shadow_verdicts=["Promote"],
+            )
+
+        monkeypatch.setattr(
+            "src.deriver.consumer.run_promotion_cycle",
+            _cycle,
+        )
+        caplog.set_level(logging.INFO, logger="src.deriver.consumer")
+        await process_reconciler(
+            ReconcilerPayload(reconciler_type=ReconcilerType.PROMOTE_ESTABLISHED)
+        )
+        line = next(
+            rec.getMessage()
+            for rec in caplog.records
+            if "Promotion cycle complete:" in rec.getMessage()
+        )
+        assert "shadow=Promote" in line
 
     @pytest.mark.asyncio
     async def test_idempotent_rerun_no_double_mint(

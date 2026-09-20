@@ -98,6 +98,19 @@ def _merge_confirmations(base: Confirmations, extra: Confirmations) -> Confirmat
     return Confirmations(by_neighbour=merged)
 
 
+def _log_established_pass(mode: str, result: EstablishedPassResult) -> None:
+    logger.info(
+        "Established pass complete: mode=%s reinforced=%s superseded=%s "
+        "left_working=%s undecided=%s shadow=%s",
+        mode,
+        len(result.reinforced),
+        len(result.superseded),
+        result.left_working,
+        result.awaiting_confirm_undecided,
+        ",".join(result.shadow_verdicts) or "-",
+    )
+
+
 async def run_established_pass(
     accepted: Sequence[_AcceptedExplicit],
     *,
@@ -126,10 +139,11 @@ async def run_established_pass(
             neighbourhoods,
             confirmer=confirmer,
         )
+        names = [type(verdicts[acc.id]).__name__ for acc in accepted]
         if mode == "shadow":
+            result.shadow_verdicts.extend(names)
             for acc in accepted:
                 v = verdicts[acc.id]
-                result.shadow_verdicts.append(type(v).__name__)
                 if isinstance(v, Leave):
                     result.left_working += 1
                     if v.reason == "undecided":
@@ -138,15 +152,19 @@ async def run_established_pass(
                     # Should be rare after the confirm loop; count as leave.
                     result.left_working += 1
                     result.awaiting_confirm_undecided += 1
+            _log_established_pass(mode, result)
             return result
 
-        return await _phase_apply(
+        result = await _phase_apply(
             accepted,
             verdicts,
             workspace_name=workspace_name,
             observer=observer,
             observed=observed,
         )
+        result.shadow_verdicts.extend(names)
+        _log_established_pass(mode, result)
+        return result
     except Exception:
         logger.exception(
             "Established pass failed for %s/%s/%s",

@@ -469,7 +469,8 @@ async def process_reconciler(payload: ReconcilerPayload) -> None:
         ):
             logger.info(
                 "Promotion cycle complete: examined=%s promoted=%s reinforced=%s "
-                "undecided=%s left_working=%s dream_hints=%s duration_ms=%.1f",
+                "undecided=%s left_working=%s dream_hints=%s duration_ms=%.1f "
+                "shadow=%s",
                 metrics.examined,
                 metrics.promoted,
                 metrics.reinforced_established,
@@ -477,6 +478,7 @@ async def process_reconciler(payload: ReconcilerPayload) -> None:
                 metrics.left_working,
                 metrics.dream_hints,
                 duration_ms,
+                ",".join(metrics.shadow_verdicts) or "-",
             )
 
     else:

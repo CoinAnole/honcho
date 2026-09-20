@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import pytest
@@ -203,15 +204,36 @@ class TestEstablishedPass:
         del seed_explicit
 
     @pytest.mark.asyncio
+    async def test_empty_accepted_does_not_log_complete(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        caplog.set_level(logging.INFO, logger="src.crud.established")
+        result = await run_established_pass(
+            [],
+            workspace_name="w",
+            observer="a",
+            observed="b",
+            confirmer=NeverConfirmer(),
+            mode="shadow",
+        )
+        assert result.shadow_verdicts == []
+        assert not any(
+            "Established pass complete:" in rec.getMessage() for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_mode_shadow_counts_without_writes(
         self,
         db_session: AsyncSession,
         sample_data: tuple[models.Workspace, models.Peer],
         established_mode,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ):
         test_workspace, test_peer = sample_data
         established_mode("shadow")
+        caplog.set_level(logging.INFO, logger="src.crud.established")
         monkeypatch.setattr(
             "src.memory.confirm.confirmer_from_settings",
             lambda _s: NeverConfirmer(),
@@ -268,6 +290,12 @@ class TestEstablishedPass:
         )
         assert result.established.shadow_verdicts
         assert result.established.left_working >= 1
+        line = next(
+            rec.getMessage()
+            for rec in caplog.records
+            if "Established pass complete:" in rec.getMessage()
+        )
+        assert "shadow=Leave" in line
         established = (
             await db_session.execute(
                 select(models.Document).where(
@@ -286,9 +314,11 @@ class TestEstablishedPass:
         sample_data: tuple[models.Workspace, models.Peer],
         established_mode,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ):
         test_workspace, test_peer = sample_data
         established_mode("on")
+        caplog.set_level(logging.INFO, logger="src.crud.established")
         monkeypatch.setattr(
             "src.memory.confirm.confirmer_from_settings",
             lambda _s: NeverConfirmer(),
@@ -350,6 +380,13 @@ class TestEstablishedPass:
             observed=observed.name,
         )
         assert established_before.id in result.established.reinforced
+        assert "Reinforce" in result.established.shadow_verdicts
+        line = next(
+            rec.getMessage()
+            for rec in caplog.records
+            if "Established pass complete:" in rec.getMessage()
+        )
+        assert "shadow=Reinforce" in line
         await db_session.refresh(established_before)
         assert established_before.times_derived == 2
         assert established_before.last_reinforced_at is not None
