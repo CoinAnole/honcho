@@ -44,9 +44,9 @@ from src.crud.document import (
     EstablishedPassResult,
     Neighbour,
     NeighbourScope,
-    _DocumentRowOp,
     _apply_document_row_updates,
     _document_model_from_create,
+    _DocumentRowOp,
     _insert_established_evidence,
     _normalize_content,
     find_neighbours,
@@ -813,7 +813,9 @@ async def heal_live_established_pairs(
         )
     async with tracked_db("established_heal_apply") as db:
         ops = [
-            _DocumentRowOp("supersede", directive.loser_id, winner_id=directive.winner_id)
+            _DocumentRowOp(
+                "supersede", directive.loser_id, winner_id=directive.winner_id
+            )
             for directive in directives
         ]
         await _apply_document_row_updates(
@@ -825,7 +827,9 @@ async def heal_live_established_pairs(
         )
         await db.commit()
     return HealResult(
-        collapsed=[(directive.winner_id, directive.loser_id) for directive in directives],
+        collapsed=[
+            (directive.winner_id, directive.loser_id) for directive in directives
+        ],
         left_unconfirmed=left_unconfirmed,
         left_unrelated=left_unrelated,
     )
