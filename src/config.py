@@ -1449,6 +1449,14 @@ class EstablishedSettings(HonchoSettings):
     PROMOTION_INTERVAL_SECONDS: int = 900
     PROMOTION_BATCH_SIZE: int = 200
 
+    @model_validator(mode="after")
+    def _require_confirm_model_when_on(self) -> "EstablishedSettings":
+        if self.MODE == "on" and self.CONFIRM_MODEL is None:
+            raise ValueError(
+                "ESTABLISHED.MODE is 'on' but ESTABLISHED.CONFIRM_MODEL is unset"
+            )
+        return self
+
 
 class VectorStoreSettings(HonchoSettings):
     """Settings for vector store (pgvector, Turbopuffer, LanceDB or Qdrant)."""

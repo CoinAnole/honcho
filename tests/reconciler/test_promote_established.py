@@ -364,6 +364,10 @@ class TestPromoteEstablished:
         )
         assert len(explicits) == 2
         assert all(doc.deleted_at is None for doc in explicits)
+        assert all(
+            (doc.internal_metadata or {}).get("promotion_examined_at")
+            for doc in explicits
+        )
 
     @pytest.mark.asyncio
     async def test_existing_established_reinforces_not_second_mint(
@@ -645,3 +649,98 @@ class TestPromoteEstablished:
             db_session, test_workspace.name, test_peer.name, observed.name
         )
         assert len(derived) == 1
+
+    @pytest.mark.asyncio
+    async def test_leave_undecided_does_not_stamp(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session_a, session_b = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        await crud.create_documents(
+            db_session,
+            [
+                _explicit(
+                    "Alice likes tea in the morning",
+                    embedding=_axis_embedding(),
+                    session_name=session_a.name,
+                    message_id=10,
+                ),
+                _explicit(
+                    "Alice prefers coffee after lunch",
+                    embedding=_embedding_at_distance(0.09),
+                    session_name=session_b.name,
+                    message_id=20,
+                    message_created_at="2026-06-01T00:00:00Z",
+                ),
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+        )
+        await db_session.commit()
+
+        established_mode("on")
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
+
+        assert metrics.promoted == 0
+        assert metrics.reinforced_established == 0
+        assert metrics.undecided == 2
+        assert metrics.examined == 0
+        explicits = await self._explicits(
+            db_session, test_workspace.name, test_peer.name, observed.name
+        )
+        assert len(explicits) == 2
+        assert all(
+            not (doc.internal_metadata or {}).get("promotion_examined_at")
+            for doc in explicits
+        )
+        assert await has_pending_promotion_work(db_session) is True
+
+    @pytest.mark.asyncio
+    async def test_leave_unrelated_still_stamps(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session_a, _session_b = await self._setup(
+            db_session, test_workspace, test_peer
+        )
+
+        await crud.create_documents(
+            db_session,
+            [
+                _explicit(
+                    "Alice likes tea",
+                    embedding=_axis_embedding(),
+                    session_name=session_a.name,
+                    message_id=10,
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+        )
+        await db_session.commit()
+
+        established_mode("on")
+        metrics = await run_promotion_cycle(batch_size=50, confirmer=NeverConfirmer())
+
+        assert metrics.promoted == 0
+        assert metrics.left_working == 1
+        assert metrics.examined == 1
+        explicits = await self._explicits(
+            db_session, test_workspace.name, test_peer.name, observed.name
+        )
+        assert len(explicits) == 1
+        assert (explicits[0].internal_metadata or {}).get("promotion_examined_at")
+        assert await has_pending_promotion_work(db_session) is False
