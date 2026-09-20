@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import getLogger
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import delete, literal, or_, select, update
 from sqlalchemy.engine import CursorResult
@@ -33,6 +33,9 @@ from src.vector_store import (
     VectorStore,
     get_external_vector_store,
 )
+
+if TYPE_CHECKING:
+    from src.crud.established import _AcceptedExplicit
 
 logger = getLogger(__name__)
 
@@ -777,6 +780,7 @@ class CreateDocumentsResult:
     semantic_dup_rejected_count: int = 0
     semantic_dup_replaced_count: int = 0
     established: EstablishedPassResult = field(default_factory=EstablishedPassResult)
+    pending_established: list["_AcceptedExplicit"] = field(default_factory=list)
 
 
 async def create_documents(
@@ -796,11 +800,10 @@ async def create_documents(
     dedup via ``is_rejected_duplicate`` for documents that survive the exact
     deduplication check.
 
-    After the working-layer commit (and vector upsert), when
-    ``settings.ESTABLISHED.MODE != "off"`` and ``_established_pass`` is True,
-    accepted explicit evidence snapshots are handed to
-    ``run_established_pass`` (own short sessions; ``db`` is not held across
-    confirm). Mint paths pass ``_established_pass=False``.
+    After the working-layer commit (and vector upsert), accepted explicit
+    evidence snapshots are returned on ``pending_established`` when
+    ``_established_pass`` is True. The caller runs the established pass after
+    its session closes.
 
     Args:
         db: Database session
@@ -809,11 +812,11 @@ async def create_documents(
         observer: Name of the observing peer
         observed: Name of the observed peer
         deduplicate: Enable semantic duplicate detection
-        _established_pass: Internal; False disables the post-commit established pass
+        _established_pass: Internal; False leaves pending_established empty
 
     Returns:
-        CreateDocumentsResult with inserted documents and optional established
-        pass counts.
+        CreateDocumentsResult with inserted documents and pending established
+        snapshots. ``established`` starts empty.
     """
     from src.memory.evidence import evidence_key_from_document
 
@@ -829,6 +832,8 @@ async def create_documents(
         document_id: str,
         doc: schemas.DocumentCreate,
     ) -> None:
+        if not _established_pass:
+            return
         if doc.level != "explicit" or not doc.embedding or doc.session_name is None:
             return
         evidence = evidence_key_from_document(doc)
@@ -1176,36 +1181,13 @@ async def create_documents(
         await db.rollback()
         raise
 
-    established_result = EstablishedPassResult()
-    mode = settings.ESTABLISHED.MODE
-    if _established_pass and mode != "off" and established_snapshots:
-        try:
-            from src.crud.established import run_established_pass
-            from src.memory.confirm import confirmer_from_settings
-
-            established_result = await run_established_pass(
-                established_snapshots,
-                workspace_name=workspace_name,
-                observer=observer,
-                observed=observed,
-                confirmer=confirmer_from_settings(settings.ESTABLISHED),
-                mode=cast(Literal["shadow", "on"], mode),
-            )
-        except Exception:
-            logger.exception(
-                "Established pass failed for %s/%s/%s; leaving working rows",
-                workspace_name,
-                observer,
-                observed,
-            )
-
     return CreateDocumentsResult(
         created_documents=accepted_documents,
         exact_dup_existing_count=exact_dup_existing_count,
         exact_dup_in_batch_count=exact_dup_in_batch_count,
         semantic_dup_rejected_count=semantic_dup_rejected_count,
         semantic_dup_replaced_count=semantic_dup_replaced_count,
-        established=established_result,
+        pending_established=established_snapshots,
     )
 
 

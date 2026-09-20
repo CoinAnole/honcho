@@ -32,7 +32,7 @@ import datetime
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +41,7 @@ from sqlalchemy.sql.functions import func
 from src import models, schemas
 from src.config import settings
 from src.crud.document import (
+    CreateDocumentsResult,
     EstablishedPassResult,
     Neighbour,
     NeighbourScope,
@@ -202,7 +203,7 @@ async def run_established_pass(
     confirmer: Confirmer,
     mode: Literal["shadow", "on"],
 ) -> EstablishedPassResult:
-    """Run the established pass. Never raises into ``create_documents``.
+    """Run the established pass.
 
     Failures log and leave rows working. Retries converge via evidence keys.
     MODE=on calls the healer after apply, including an empty apply. Promotion
@@ -273,6 +274,37 @@ async def run_established_pass(
             observed,
         )
         return result
+
+
+async def run_established_pass_for(
+    result: CreateDocumentsResult,
+    *,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+) -> None:
+    """Run the write-time pass after the caller's session has closed."""
+    mode = settings.ESTABLISHED.MODE
+    if mode == "off" or not result.pending_established:
+        return
+    try:
+        from src.memory.confirm import confirmer_from_settings
+
+        result.established = await run_established_pass(
+            result.pending_established,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            confirmer=confirmer_from_settings(settings.ESTABLISHED),
+            mode=cast(Literal["shadow", "on"], mode),
+        )
+    except Exception:
+        logger.exception(
+            "Established pass failed for %s/%s/%s; leaving working rows",
+            workspace_name,
+            observer,
+            observed,
+        )
 
 
 async def _phase_neighbours(

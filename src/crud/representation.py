@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src import crud, exceptions, models, schemas
 from src.config import settings
 from src.crud.document import _most_derived_order_by
+from src.crud.established import run_established_pass_for
 from src.dependencies import tracked_db
 from src.dreamer.dream_scheduler import check_and_schedule_dream
 from src.embedding_client import EmbeddingTokenLimitError, embedding_client
@@ -144,14 +145,13 @@ class RepresentationManager:
         # Batch create document objects
         create_document_start = time.perf_counter()
         async with tracked_db("representation_manager.save_representation") as db:
-            new_documents_result = await self._save_representation_internal(
+            collection, new_documents_result = await self._save_representation_internal(
                 db,
                 all_observations,
                 embeddings,
                 message_ids,
                 session_name,
                 message_created_at,
-                message_level_configuration,
             )
 
         create_document_duration = (time.perf_counter() - create_document_start) * 1000
@@ -161,6 +161,19 @@ class RepresentationManager:
             create_document_duration,
             "ms",
         )
+
+        await run_established_pass_for(
+            new_documents_result,
+            workspace_name=self.workspace_name,
+            observer=self.observer,
+            observed=self.observed,
+        )
+        if message_level_configuration.dream.enabled:
+            try:
+                async with tracked_db("representation_manager.dream_check") as db:
+                    await check_and_schedule_dream(db, collection)
+            except Exception as e:
+                logger.warning(f"Failed to check dream scheduling: {e}")
 
         return new_documents_result
 
@@ -172,8 +185,7 @@ class RepresentationManager:
         message_ids: list[int],
         session_name: str,
         message_created_at: datetime.datetime,
-        message_level_configuration: ResolvedConfiguration,
-    ) -> crud.CreateDocumentsResult:
+    ) -> tuple[models.Collection, crud.CreateDocumentsResult]:
         # get_or_create_collection already handles IntegrityError with rollback and a retry
         collection = await crud.get_or_create_collection(
             db,
@@ -221,13 +233,7 @@ class RepresentationManager:
             deduplicate=settings.DERIVER.DEDUPLICATE,
         )
 
-        if message_level_configuration.dream.enabled:
-            try:
-                await check_and_schedule_dream(db, collection)
-            except Exception as e:
-                logger.warning(f"Failed to check dream scheduling: {e}")
-
-        return accepted_documents_result
+        return collection, accepted_documents_result
 
     async def get_working_representation(
         self,
