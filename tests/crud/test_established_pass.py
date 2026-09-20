@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import pytest
@@ -209,9 +210,11 @@ class TestEstablishedPass:
         sample_data: tuple[models.Workspace, models.Peer],
         established_mode,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ):
         test_workspace, test_peer = sample_data
         established_mode("shadow")
+        caplog.set_level(logging.INFO, logger="src.crud.established")
         monkeypatch.setattr(
             "src.memory.confirm.confirmer_from_settings",
             lambda _s: NeverConfirmer(),
@@ -268,6 +271,12 @@ class TestEstablishedPass:
         )
         assert result.established.shadow_verdicts
         assert result.established.left_working >= 1
+        line = next(
+            rec.getMessage()
+            for rec in caplog.records
+            if "Established pass complete:" in rec.getMessage()
+        )
+        assert "shadow=Leave" in line
         established = (
             await db_session.execute(
                 select(models.Document).where(
