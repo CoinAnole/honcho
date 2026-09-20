@@ -1,6 +1,6 @@
 import pytest
 
-from src.config import ConfiguredModelSettings, DeriverSettings
+from src.config import ConfiguredModelSettings, DeriverSettings, EstablishedSettings
 
 
 def _make_deriver_settings(
@@ -128,3 +128,33 @@ def test_provider_timeout_on_fallback_overrides_is_validated_at_config_load() ->
                 },
             }
         )
+
+
+def test_established_mode_on_without_confirm_model_is_rejected() -> None:
+    with pytest.raises(ValueError, match="MODE") as exc_info:
+        EstablishedSettings(MODE="on", CONFIRM_MODEL=None)
+    assert "CONFIRM_MODEL" in str(exc_info.value)
+
+
+def test_established_mode_shadow_without_confirm_model_is_valid() -> None:
+    loaded = EstablishedSettings(MODE="shadow", CONFIRM_MODEL=None)
+    assert loaded.MODE == "shadow"
+    assert loaded.CONFIRM_MODEL is None
+
+
+def test_established_mode_off_without_confirm_model_is_valid() -> None:
+    loaded = EstablishedSettings(MODE="off", CONFIRM_MODEL=None)
+    assert loaded.MODE == "off"
+    assert loaded.CONFIRM_MODEL is None
+
+
+def test_established_mode_on_with_confirm_model_is_valid() -> None:
+    loaded = EstablishedSettings(
+        MODE="on",
+        CONFIRM_MODEL=ConfiguredModelSettings(
+            model="gpt-5.4-mini",
+            transport="openai",
+        ),
+    )
+    assert loaded.MODE == "on"
+    assert loaded.CONFIRM_MODEL is not None
