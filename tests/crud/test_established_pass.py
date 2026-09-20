@@ -18,6 +18,7 @@ from src.crud.established import (
     heal_live_established_pairs,
     mint_established_row,
     run_established_pass,
+    run_established_pass_for,
 )
 from src.memory.bands import CANDIDATE_MAX
 from src.memory.confirm import ClaimKind, ConfirmAnswer, Confirmations, NeverConfirmer
@@ -39,6 +40,30 @@ def _embedding_at_distance(distance: float) -> list[float]:
     vector[0] = cosine
     vector[1] = sine
     return vector
+
+
+async def _create_and_pass(
+    db: AsyncSession,
+    documents: list[schemas.DocumentCreate],
+    workspace_name: str,
+    *,
+    observer: str,
+    observed: str,
+) -> crud.CreateDocumentsResult:
+    result = await crud.create_documents(
+        db,
+        documents,
+        workspace_name,
+        observer=observer,
+        observed=observed,
+    )
+    await run_established_pass_for(
+        result,
+        workspace_name=workspace_name,
+        observer=observer,
+        observed=observed,
+    )
+    return result
 
 
 class FakeConfirmer:
@@ -172,7 +197,7 @@ class TestEstablishedPass:
             observer=test_peer.name,
             observed=observed.name,
         )
-        result = await crud.create_documents(
+        result = await _create_and_pass(
             db_session,
             [
                 self._explicit(
@@ -272,7 +297,7 @@ class TestEstablishedPass:
             _established_pass=False,
         )
         # Candidate-band neighbour (NeverConfirmer → Leave undecided)
-        result = await crud.create_documents(
+        result = await _create_and_pass(
             db_session,
             [
                 self._explicit(
@@ -363,7 +388,7 @@ class TestEstablishedPass:
         ).scalar_one()
         assert established_before.times_derived == 1
 
-        result = await crud.create_documents(
+        result = await _create_and_pass(
             db_session,
             [
                 self._explicit(
@@ -452,7 +477,7 @@ class TestEstablishedPass:
             observed=observed.name,
             _established_pass=False,
         )
-        result = await crud.create_documents(
+        result = await _create_and_pass(
             db_session,
             [
                 self._explicit(
@@ -536,7 +561,7 @@ class TestEstablishedPass:
             )
         ).scalar_one()
 
-        result = await crud.create_documents(
+        result = await _create_and_pass(
             db_session,
             [
                 self._explicit(
@@ -655,7 +680,7 @@ class TestEstablishedPass:
             observed=observed.name,
             _established_pass=False,
         )
-        first = await crud.create_documents(
+        first = await _create_and_pass(
             db_session,
             [
                 self._explicit(
@@ -1126,3 +1151,51 @@ class TestEstablishedPass:
         assert older.deleted_at is not None
         assert older.internal_metadata.get("superseded_by") == newer.id
         assert newer.deleted_at is None
+
+    @pytest.mark.asyncio
+    async def test_established_pass_false_leaves_pending_empty(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("shadow")
+
+        class BoomConfirmer:
+            async def confirm(self, new_content, candidates):
+                raise AssertionError("confirm must not run")
+
+        monkeypatch.setattr(
+            "src.memory.confirm.confirmer_from_settings",
+            lambda _s: BoomConfirmer(),
+        )
+        observed, session = await self._setup(db_session, test_workspace, test_peer)
+        result = await crud.create_documents(
+            db_session,
+            [
+                self._explicit(
+                    "Alice works at Blue Facility",
+                    embedding=_embedding_at_distance(0.08),
+                    session_name=session.name,
+                    message_id=90,
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        assert result.pending_established == []
+        assert result.established.reinforced == []
+        assert result.established.superseded == []
+        assert result.established.shadow_verdicts == []
+        assert result.established.left_working == 0
+        await run_established_pass_for(
+            result,
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+        )
+        assert result.established.shadow_verdicts == []

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
 from src.config import settings
+from src.crud.established import run_established_pass_for
 from src.dependencies import tracked_db
 from src.embedding_client import EmbeddingTokenLimitError, embedding_client
 from src.exceptions import ResourceNotFoundException
@@ -1204,16 +1205,21 @@ async def create_observations(
     accepted: list[schemas.DocumentCreate] = []
     if documents:
         async with tracked_db("create_observations.save") as db:
-            accepted = (
-                await crud.create_documents(
-                    db,
-                    documents=documents,
-                    workspace_name=workspace_name,
-                    observer=observer,
-                    observed=observed,
-                    deduplicate=settings.DERIVER.DEDUPLICATE,
-                )
-            ).created_documents
+            result = await crud.create_documents(
+                db,
+                documents=documents,
+                workspace_name=workspace_name,
+                observer=observer,
+                observed=observed,
+                deduplicate=settings.DERIVER.DEDUPLICATE,
+            )
+        await run_established_pass_for(
+            result,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+        )
+        accepted = result.created_documents
         logger.info(
             "Created %d observations in %s/%s/%s",
             len(accepted),

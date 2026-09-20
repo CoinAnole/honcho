@@ -1,15 +1,22 @@
+import math
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from nanoid import generate as generate_nanoid
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src import models
+from src import crud, models, schemas
+from src.config import settings
+from src.crud import representation as representation_mod
+from src.crud.collection import (
+    get_or_create_collection as real_get_or_create_collection,
+)
 from src.crud.document import CreateDocumentsResult
 from src.crud.representation import RepresentationManager
+from src.memory.confirm import ConfirmAnswer, Confirmations
 from src.schemas.configuration import (
     ResolvedConfiguration,
     ResolvedDreamConfiguration,
@@ -192,6 +199,7 @@ class TestRepresentationManagerSoftDelete:
             observed=test_peer2.name,
             content="Live observation",
             session_name=test_session.name,
+            level="deductive",
             times_derived=5,
         )
         doc_deleted = models.Document(
@@ -200,6 +208,7 @@ class TestRepresentationManagerSoftDelete:
             observed=test_peer2.name,
             content="Deleted high-derived observation",
             session_name=test_session.name,
+            level="deductive",
             times_derived=100,
         )
         db_session.add_all([doc_live, doc_deleted])
@@ -250,6 +259,7 @@ class TestRepresentationManagerSoftDelete:
                     observed=test_peer2.name,
                     content=f"tie {i}",
                     session_name=test_session.name,
+                    level="deductive",
                     times_derived=1,
                     created_at=base + timedelta(days=i),
                 )
@@ -262,6 +272,7 @@ class TestRepresentationManagerSoftDelete:
                 observed=test_peer2.name,
                 content="hot",
                 session_name=test_session.name,
+                level="deductive",
                 times_derived=5,
                 created_at=base - timedelta(days=10),
             )
@@ -551,7 +562,10 @@ class TestRepresentationManagerSave:
                 manager,
                 "_save_representation_internal",
                 new=AsyncMock(
-                    return_value=CreateDocumentsResult(created_documents=[MagicMock()])
+                    return_value=(
+                        MagicMock(),
+                        CreateDocumentsResult(created_documents=[MagicMock()]),
+                    )
                 ),
             ) as mock_save,
         ):
@@ -609,7 +623,10 @@ class TestRepresentationManagerSave:
                 manager,
                 "_save_representation_internal",
                 new=AsyncMock(
-                    return_value=CreateDocumentsResult(created_documents=[MagicMock()])
+                    return_value=(
+                        MagicMock(),
+                        CreateDocumentsResult(created_documents=[MagicMock()]),
+                    )
                 ),
             ) as mock_save,
         ):
@@ -718,7 +735,10 @@ class TestRepresentationManagerSave:
                 manager,
                 "_save_representation_internal",
                 new=AsyncMock(
-                    return_value=CreateDocumentsResult(created_documents=[MagicMock()])
+                    return_value=(
+                        MagicMock(),
+                        CreateDocumentsResult(created_documents=[MagicMock()]),
+                    )
                 ),
             ) as mock_save,
         ):
@@ -834,7 +854,10 @@ class TestRepresentationManagerSave:
                 manager,
                 "_save_representation_internal",
                 new=AsyncMock(
-                    return_value=CreateDocumentsResult(created_documents=[MagicMock()])
+                    return_value=(
+                        MagicMock(),
+                        CreateDocumentsResult(created_documents=[MagicMock()]),
+                    )
                 ),
             ),
         ):
@@ -849,6 +872,281 @@ class TestRepresentationManagerSave:
         mock_embed.assert_awaited_once_with(
             ["inferred fact", "short fact"], on_oversize="truncate"
         )
+
+
+_DIM = 1536
+
+
+def _axis_embedding() -> list[float]:
+    vector = [0.0] * _DIM
+    vector[0] = 1.0
+    return vector
+
+
+def _embedding_at_distance(distance: float) -> list[float]:
+    cosine = 1.0 - distance
+    sine = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+    vector = [0.0] * _DIM
+    vector[0] = cosine
+    vector[1] = sine
+    return vector
+
+
+class _SessionSpyConfirmer:
+    def __init__(self, events: list[str]):
+        self.events = events
+
+    async def confirm(self, new_content: str, candidates):
+        del new_content
+        depth = 0
+        for event in self.events:
+            if event.startswith("enter:"):
+                depth += 1
+            elif event.startswith("exit:"):
+                depth -= 1
+        assert depth == 0, self.events
+        self.events.append("confirm")
+        return Confirmations.from_answers(
+            [(n.id, ConfirmAnswer.UNDECIDED, None, n.distance) for n in candidates]
+        )
+
+
+class TestSaveRepresentationSessionRelease:
+    async def _setup_pair(
+        self,
+        db_session: AsyncSession,
+        test_workspace: models.Workspace,
+        test_peer: models.Peer,
+    ) -> tuple[models.Peer, models.Session, RepresentationManager]:
+        observed = models.Peer(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        session = models.Session(
+            name=str(generate_nanoid()), workspace_name=test_workspace.name
+        )
+        db_session.add_all([observed, session])
+        await db_session.flush()
+        db_session.add(
+            models.Collection(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=observed.name,
+                internal_metadata={},
+            )
+        )
+        await db_session.commit()
+        manager = RepresentationManager(
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+        )
+        return observed, session, manager
+
+    async def _seed_established_neighbour(
+        self,
+        db_session: AsyncSession,
+        workspace_name: str,
+        observer: str,
+        observed: str,
+        session_name: str,
+    ) -> None:
+        await crud.create_documents(
+            db_session,
+            [
+                schemas.DocumentCreate(
+                    content="seed",
+                    embedding=_axis_embedding(),
+                    session_name=session_name,
+                    level="explicit",
+                    metadata=schemas.DocumentMetadata(
+                        message_ids=[1],
+                        message_created_at="2026-01-01T00:00:00Z",
+                    ),
+                )
+            ],
+            workspace_name,
+            observer=observer,
+            observed=observed,
+            _established_pass=False,
+        )
+        source_id = (
+            await db_session.execute(
+                select(models.Document.id).where(models.Document.content == "seed")
+            )
+        ).scalar_one()
+        await crud.create_documents(
+            db_session,
+            [
+                schemas.DocumentCreate(
+                    content="Alice works at Blue",
+                    embedding=_axis_embedding(),
+                    session_name=None,
+                    level="deductive",
+                    source_ids=[source_id],
+                    metadata=schemas.DocumentMetadata(
+                        message_ids=[1],
+                        message_created_at="2026-01-01T00:00:00Z",
+                        source_ids=[source_id],
+                    ),
+                )
+            ],
+            workspace_name,
+            observer=observer,
+            observed=observed,
+            _established_pass=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_representation_closes_session_before_confirm(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        test_workspace, test_peer = sample_data
+        monkeypatch.setattr(settings.ESTABLISHED, "MODE", "shadow")
+        monkeypatch.setattr(settings.DREAM, "ENABLED", True)
+        monkeypatch.setattr(settings.DREAM, "DOCUMENT_THRESHOLD", 1)
+        monkeypatch.setattr(settings.DERIVER, "SCHEDULER", "deriver")
+        monkeypatch.setattr(
+            "src.crud.get_or_create_collection",
+            real_get_or_create_collection,
+        )
+        observed, session, manager = await self._setup_pair(
+            db_session, test_workspace, test_peer
+        )
+        await self._seed_established_neighbour(
+            db_session,
+            test_workspace.name,
+            test_peer.name,
+            observed.name,
+            session.name,
+        )
+
+        events: list[str] = []
+        spy = _SessionSpyConfirmer(events)
+        monkeypatch.setattr(
+            "src.memory.confirm.confirmer_from_settings",
+            lambda _s: spy,
+        )
+
+        current_tracked_db = representation_mod.tracked_db
+
+        @asynccontextmanager
+        async def recording_tracked_db(name: str, *args, **kwargs):
+            events.append(f"enter:{name}")
+            try:
+                async with current_tracked_db(name, *args, **kwargs) as db:
+                    yield db
+            finally:
+                events.append(f"exit:{name}")
+
+        monkeypatch.setattr(representation_mod, "tracked_db", recording_tracked_db)
+
+        async def schedule_dream(*_args, **_kwargs):
+            events.append("schedule_dream")
+
+        fake_scheduler = MagicMock()
+        fake_scheduler.schedule_dream = AsyncMock(side_effect=schedule_dream)
+        monkeypatch.setattr(
+            "src.dreamer.dream_scheduler._dream_scheduler",
+            fake_scheduler,
+        )
+
+        representation = Representation(
+            explicit=[
+                ExplicitObservation(
+                    content="Alice works at Blue Facility",
+                    created_at=datetime.now(UTC),
+                    message_ids=[20],
+                    session_name=session.name,
+                )
+            ]
+        )
+        with patch(
+            "src.crud.representation.embedding_client.simple_batch_embed",
+            new=AsyncMock(return_value=[_embedding_at_distance(0.08)]),
+        ):
+            result = await manager.save_representation(
+                representation,
+                message_ids=[20],
+                session_name=session.name,
+                message_created_at=datetime.now(UTC),
+                message_level_configuration=_resolved_config(dream_enabled=True),
+            )
+
+        assert result.created_documents
+        assert events == [
+            "enter:representation_manager.save_representation",
+            "exit:representation_manager.save_representation",
+            "confirm",
+            "enter:representation_manager.dream_check",
+            "schedule_dream",
+            "exit:representation_manager.dream_check",
+        ]
+        fake_scheduler.schedule_dream.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_save_representation_schedules_dream_when_pass_raises(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        test_workspace, test_peer = sample_data
+        monkeypatch.setattr(settings.ESTABLISHED, "MODE", "shadow")
+        monkeypatch.setattr(settings.DREAM, "ENABLED", True)
+        monkeypatch.setattr(settings.DREAM, "DOCUMENT_THRESHOLD", 1)
+        monkeypatch.setattr(settings.DERIVER, "SCHEDULER", "deriver")
+        monkeypatch.setattr(
+            "src.crud.get_or_create_collection",
+            real_get_or_create_collection,
+        )
+        observed, session, manager = await self._setup_pair(
+            db_session, test_workspace, test_peer
+        )
+
+        scheduled = AsyncMock()
+        fake_scheduler = MagicMock()
+        fake_scheduler.schedule_dream = scheduled
+        monkeypatch.setattr(
+            "src.dreamer.dream_scheduler._dream_scheduler",
+            fake_scheduler,
+        )
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("pass failed")
+
+        monkeypatch.setattr(
+            "src.crud.established.run_established_pass",
+            boom,
+        )
+
+        representation = Representation(
+            explicit=[
+                ExplicitObservation(
+                    content="Alice works at Blue Facility",
+                    created_at=datetime.now(UTC),
+                    message_ids=[20],
+                    session_name=session.name,
+                )
+            ]
+        )
+        with patch(
+            "src.crud.representation.embedding_client.simple_batch_embed",
+            new=AsyncMock(return_value=[_embedding_at_distance(0.08)]),
+        ):
+            result = await manager.save_representation(
+                representation,
+                message_ids=[20],
+                session_name=session.name,
+                message_created_at=datetime.now(UTC),
+                message_level_configuration=_resolved_config(dream_enabled=True),
+            )
+
+        assert result.created_documents
+        scheduled.assert_awaited()
+        del observed
 
 
 class TestVectorQueryTopKFloor:

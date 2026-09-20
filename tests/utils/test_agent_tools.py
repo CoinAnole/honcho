@@ -2,8 +2,10 @@
 
 import asyncio
 import inspect
+import math
 import re
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
@@ -16,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
 from src.config import settings
+from src.memory.confirm import ConfirmAnswer, Confirmations
+from src.utils import agent_tools as agent_tools_mod
 from src.utils.agent_tools import (
     _TOOL_HANDLERS,  # pyright: ignore[reportPrivateUsage]
     _WORKSPACE_TOOL_HANDLERS,  # pyright: ignore[reportPrivateUsage]
@@ -54,6 +58,7 @@ from src.utils.agent_tools import (
     get_recent_history,
 )
 from src.utils.evidence import EvidenceAccumulator
+from src.utils.types import ToolResult
 
 # =============================================================================
 # Fixtures
@@ -831,6 +836,120 @@ class TestCreateObservations:
 
         assert isinstance(result, ObservationsCreatedResult)
         assert captured["deduplicate"] is deduplicate_setting
+
+    async def test_create_observations_closes_session_before_confirm(
+        self,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        workspace, peer1, peer2, _session, messages, documents = tool_test_data
+        monkeypatch.setattr(settings.ESTABLISHED, "MODE", "shadow")
+
+        source_id = documents[0].id
+        async with agent_tools_mod.tracked_db("test_agent_tools.seed") as db:
+            await crud.create_documents(
+                db,
+                [
+                    schemas.DocumentCreate(
+                        content="Alice works at Blue",
+                        embedding=_axis_embedding(),
+                        session_name=None,
+                        level="deductive",
+                        source_ids=[source_id],
+                        metadata=schemas.DocumentMetadata(
+                            message_ids=[1],
+                            message_created_at="2026-01-01T00:00:00Z",
+                            source_ids=[source_id],
+                        ),
+                    )
+                ],
+                workspace.name,
+                observer=peer1.name,
+                observed=peer2.name,
+                _established_pass=False,
+            )
+
+        events: list[str] = []
+
+        class SpyConfirmer:
+            async def confirm(self, new_content, candidates):
+                del new_content
+                depth = 0
+                for event in events:
+                    if event.startswith("enter:"):
+                        depth += 1
+                    elif event.startswith("exit:"):
+                        depth -= 1
+                assert depth == 0, events
+                events.append("confirm")
+                return Confirmations.from_answers(
+                    [
+                        (n.id, ConfirmAnswer.UNDECIDED, None, n.distance)
+                        for n in candidates
+                    ]
+                )
+
+        monkeypatch.setattr(
+            "src.memory.confirm.confirmer_from_settings",
+            lambda _s: SpyConfirmer(),
+        )
+
+        current_tracked_db = agent_tools_mod.tracked_db
+
+        @asynccontextmanager
+        async def recording_tracked_db(name: str, *args, **kwargs):
+            events.append(f"enter:{name}")
+            try:
+                async with current_tracked_db(name, *args, **kwargs) as db:
+                    yield db
+            finally:
+                events.append(f"exit:{name}")
+
+        monkeypatch.setattr(agent_tools_mod, "tracked_db", recording_tracked_db)
+        monkeypatch.setattr(
+            "src.utils.agent_tools.embedding_client.simple_batch_embed",
+            AsyncMock(return_value=[_embedding_at_distance(0.08)]),
+        )
+
+        ctx = make_tool_context(current_messages=messages)
+        result = await _handle_create_observations(
+            ctx,
+            {
+                "observations": [
+                    {
+                        "content": "Alice works at Blue Facility",
+                        "level": "explicit",
+                    }
+                ]
+            },
+        )
+
+        assert "Created 1 observations" in result
+        assert isinstance(result, ToolResult)
+        assert result.metadata["created_count"] == 1
+        save_enter = events.index("enter:create_observations.save")
+        save_exit = events.index("exit:create_observations.save")
+        confirm_at = events.index("confirm")
+        assert save_enter < save_exit < confirm_at
+
+
+_DIM = 1536
+
+
+def _axis_embedding() -> list[float]:
+    vector = [0.0] * _DIM
+    vector[0] = 1.0
+    return vector
+
+
+def _embedding_at_distance(distance: float) -> list[float]:
+    cosine = 1.0 - distance
+    sine = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+    vector = [0.0] * _DIM
+    vector[0] = cosine
+    vector[1] = sine
+    return vector
 
 
 class TestNormalizeObservationId:
