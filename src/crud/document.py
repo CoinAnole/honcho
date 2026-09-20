@@ -222,14 +222,13 @@ async def query_documents_most_derived(
     limit: int = 10,
     half_life: datetime.timedelta = DECAY_HALF_LIFE,
 ) -> Sequence[models.Document]:
-    """Query documents by decayed reinforcement score (fade, never delete).
+    """Query established documents by decayed reinforcement score.
 
-    Ranks by ``times_derived * 0.5^(age / half_life)`` where age is
-    ``now - coalesce(last_reinforced_at, created_at)``. Soft-deleted rows
-    stay excluded. Derived rows feel decay in practice because only they get
-    ``last_reinforced_at`` from the established path; working rows with NULL
-    ``last_reinforced_at`` decay from ``created_at``, which is the existing
-    newest-first tiebreak in disguise.
+    Restricted to ``level IN ('inductive', 'deductive')`` in SQL. Working
+    rows and contradictions are not ranked. Soft-deleted derived rows stay
+    excluded. Ranks by ``times_derived * 0.5^(age / half_life)`` where age
+    is ``now - coalesce(last_reinforced_at, created_at)``. Established rows
+    with NULL ``last_reinforced_at`` decay from ``created_at``.
 
     Args:
         db: Database session
@@ -240,8 +239,8 @@ async def query_documents_most_derived(
         half_life: Decay half-life (default 14 days)
 
     Returns:
-        Sequence of documents ordered by decayed score descending,
-        ties broken by created_at descending (most recent first)
+        Sequence of established documents ordered by decayed score
+        descending, ties broken by created_at descending
     """
     stmt = (
         select(models.Document)
@@ -250,6 +249,7 @@ async def query_documents_most_derived(
             models.Document.observer == observer,
             models.Document.observed == observed,
             models.Document.deleted_at.is_(None),
+            models.Document.level.in_(("inductive", "deductive")),
         )
         .order_by(*_most_derived_order_by(half_life))
         .limit(limit)
