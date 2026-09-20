@@ -304,8 +304,8 @@ class TestDocumentCRUD:
 
         now = datetime.datetime.now(datetime.UTC)
         base = now - datetime.timedelta(days=3)
-        # Three conclusions, all reinforced once -- the real-world steady state
-        # before the fix -- inserted oldest-first.
+        # Three established conclusions, all reinforced once -- the real-world
+        # steady state before the fix -- inserted oldest-first.
         for i in range(3):
             db_session.add(
                 models.Document(
@@ -314,6 +314,7 @@ class TestDocumentCRUD:
                     observed=test_peer2.name,
                     content=f"tie {i}",
                     session_name=test_session.name,
+                    level="inductive",
                     times_derived=1,
                     created_at=base + datetime.timedelta(days=i),
                 )
@@ -327,6 +328,7 @@ class TestDocumentCRUD:
                 observed=test_peer2.name,
                 content="hot",
                 session_name=test_session.name,
+                level="inductive",
                 times_derived=5,
                 created_at=base - datetime.timedelta(days=10),
             )
@@ -366,6 +368,7 @@ class TestDocumentCRUD:
                 observed=test_peer2.name,
                 content="fresh",
                 session_name=test_session.name,
+                level="deductive",
                 times_derived=3,
                 created_at=now - datetime.timedelta(days=30),
                 last_reinforced_at=now - datetime.timedelta(hours=1),
@@ -378,6 +381,7 @@ class TestDocumentCRUD:
                 observed=test_peer2.name,
                 content="stale",
                 session_name=test_session.name,
+                level="deductive",
                 times_derived=3,
                 created_at=now - datetime.timedelta(days=30),
                 last_reinforced_at=now - datetime.timedelta(days=28),
@@ -400,7 +404,8 @@ class TestDocumentCRUD:
         db_session: AsyncSession,
         sample_data: tuple[models.Workspace, models.Peer],
     ):
-        """Working rows without last_reinforced_at decay from created_at."""
+        """Working rows are absent. Established rows with NULL
+        last_reinforced_at decay from created_at."""
         test_workspace, test_peer = sample_data
         test_peer2, test_session, _ = await self._setup_test_data(
             db_session, test_workspace, test_peer
@@ -412,8 +417,22 @@ class TestDocumentCRUD:
                 workspace_name=test_workspace.name,
                 observer=test_peer.name,
                 observed=test_peer2.name,
-                content="recent_working",
+                content="hot_working",
                 session_name=test_session.name,
+                level="explicit",
+                times_derived=50,
+                created_at=now - datetime.timedelta(days=1),
+                last_reinforced_at=None,
+            )
+        )
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                content="recent_derived",
+                session_name=test_session.name,
+                level="inductive",
                 times_derived=2,
                 created_at=now - datetime.timedelta(days=1),
                 last_reinforced_at=None,
@@ -424,8 +443,9 @@ class TestDocumentCRUD:
                 workspace_name=test_workspace.name,
                 observer=test_peer.name,
                 observed=test_peer2.name,
-                content="old_working",
+                content="old_derived",
                 session_name=test_session.name,
+                level="deductive",
                 times_derived=2,
                 created_at=now - datetime.timedelta(days=20),
                 last_reinforced_at=None,
@@ -440,7 +460,8 @@ class TestDocumentCRUD:
             observed=test_peer2.name,
             limit=10,
         )
-        assert [d.content for d in docs] == ["recent_working", "old_working"]
+        assert [d.content for d in docs] == ["recent_derived", "old_derived"]
+        assert all(d.level in ("inductive", "deductive") for d in docs)
 
     @pytest.mark.asyncio
     async def test_most_derived_stale_high_count_loses_to_fresh_low_count(
@@ -465,6 +486,7 @@ class TestDocumentCRUD:
                 observed=test_peer2.name,
                 content="stale_hot",
                 session_name=test_session.name,
+                level="inductive",
                 times_derived=8,
                 created_at=now - datetime.timedelta(days=30),
                 last_reinforced_at=now - datetime.timedelta(days=10),
@@ -477,6 +499,7 @@ class TestDocumentCRUD:
                 observed=test_peer2.name,
                 content="fresh_cool",
                 session_name=test_session.name,
+                level="deductive",
                 times_derived=2,
                 created_at=now - datetime.timedelta(days=1),
                 last_reinforced_at=now,
@@ -493,6 +516,101 @@ class TestDocumentCRUD:
             half_life=datetime.timedelta(days=1),
         )
         assert [d.content for d in docs] == ["fresh_cool", "stale_hot"]
+
+    @pytest.mark.asyncio
+    async def test_most_derived_excludes_contradiction(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        now = datetime.datetime.now(datetime.UTC)
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                content="kept",
+                session_name=test_session.name,
+                level="inductive",
+                times_derived=2,
+                created_at=now,
+            )
+        )
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                content="contradiction",
+                session_name=test_session.name,
+                level="contradiction",
+                times_derived=99,
+                created_at=now,
+            )
+        )
+        await db_session.flush()
+
+        docs = await crud.query_documents_most_derived(
+            db_session,
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            limit=10,
+        )
+        assert [d.content for d in docs] == ["kept"]
+
+    @pytest.mark.asyncio
+    async def test_most_derived_excludes_soft_deleted_derived(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        test_workspace, test_peer = sample_data
+        test_peer2, test_session, _ = await self._setup_test_data(
+            db_session, test_workspace, test_peer
+        )
+
+        now = datetime.datetime.now(datetime.UTC)
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                content="live",
+                session_name=test_session.name,
+                level="inductive",
+                times_derived=2,
+                created_at=now,
+            )
+        )
+        db_session.add(
+            models.Document(
+                workspace_name=test_workspace.name,
+                observer=test_peer.name,
+                observed=test_peer2.name,
+                content="deleted",
+                session_name=test_session.name,
+                level="deductive",
+                times_derived=20,
+                created_at=now,
+                deleted_at=now,
+            )
+        )
+        await db_session.flush()
+
+        docs = await crud.query_documents_most_derived(
+            db_session,
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=test_peer2.name,
+            limit=10,
+        )
+        assert [d.content for d in docs] == ["live"]
 
     @pytest.mark.asyncio
     async def test_duplicate_rejection_reinforces_existing(
