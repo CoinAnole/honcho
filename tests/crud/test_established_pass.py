@@ -12,9 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
 from src.config import settings
-from src.crud.document import find_neighbours, NeighbourScope
+from src.crud.document import NeighbourScope, find_neighbours
 from src.crud.established import (
     _AcceptedExplicit,
+    heal_live_established_pairs,
     mint_established_row,
     run_established_pass,
 )
@@ -48,10 +49,7 @@ class FakeConfirmer:
     async def confirm(self, new_content: str, candidates):
         del new_content
         return Confirmations.from_answers(
-            [
-                (n.id, self.answer, self.claim_kind, n.distance)
-                for n in candidates
-            ]
+            [(n.id, self.answer, self.claim_kind, n.distance) for n in candidates]
         )
 
 
@@ -391,12 +389,17 @@ class TestEstablishedPass:
         assert established_before.times_derived == 2
         assert established_before.last_reinforced_at is not None
         ledger = (
-            await db_session.execute(
-                select(models.EstablishedEvidence).where(
-                    models.EstablishedEvidence.established_id == established_before.id
+            (
+                await db_session.execute(
+                    select(models.EstablishedEvidence).where(
+                        models.EstablishedEvidence.established_id
+                        == established_before.id
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(ledger) == 1
         assert ledger[0].evidence_digest == f"{session.name}:40-40"
 
@@ -560,10 +563,26 @@ class TestEstablishedPass:
         ).scalar_one()
         assert winner.deleted_at is None
         assert winner.level == "deductive"
+        assert winner.times_derived == 1
+        assert winner.last_reinforced_at is not None
         assert loser.id in (winner.internal_metadata.get("supersedes") or [])
+        ledger = (
+            (
+                await db_session.execute(
+                    select(models.EstablishedEvidence).where(
+                        models.EstablishedEvidence.established_id == winner.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(ledger) == 1
+        assert ledger[0].evidence_digest == f"{session.name}:60-60"
 
         # Evidence key replay: second reinforce same key is no-op on times_derived.
         td_before = winner.times_derived
+        assert td_before == 1
         snap = _AcceptedExplicit(
             id=str(generate_nanoid()),
             content="Alice works at Red Facility",
@@ -735,7 +754,7 @@ class TestEstablishedPass:
         assert nbrs[0].content == "content for llm"
 
     @pytest.mark.asyncio
-    async def test_mint_routes_through_create_documents(
+    async def test_remint_exact_dup_stays_at_times_derived_one(
         self,
         db_session: AsyncSession,
         sample_data: tuple[models.Workspace, models.Peer],
@@ -777,6 +796,8 @@ class TestEstablishedPass:
         )
         assert winner.level == "deductive"
         assert winner.session_name is None
+        assert winner.times_derived == 1
+        assert winner.last_reinforced_at is not None
         again = await mint_established_row(
             db_session,
             workspace_name=test_workspace.name,
@@ -791,9 +812,317 @@ class TestEstablishedPass:
             message_created_at="2026-01-01T00:00:00Z",
         )
         assert again.id == winner.id
+        assert again.times_derived == 1
         count = (
-            await db_session.execute(
-                select(models.Document).where(models.Document.content == "minted winner")
+            (
+                await db_session.execute(
+                    select(models.Document).where(
+                        models.Document.content == "minted winner"
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(count) == 1
+        ledger = (
+            (
+                await db_session.execute(
+                    select(models.EstablishedEvidence).where(
+                        models.EstablishedEvidence.established_id == winner.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(ledger) == 1
+
+    @pytest.mark.asyncio
+    async def test_same_batch_two_supersedes_one_loser_reinforces_first_winner(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session = await self._setup(db_session, test_workspace, test_peer)
+        await crud.create_documents(
+            db_session,
+            [
+                self._explicit(
+                    "seed",
+                    embedding=_axis_embedding(),
+                    session_name=session.name,
+                    message_id=1,
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        source_id = (
+            await db_session.execute(
+                select(models.Document.id).where(models.Document.content == "seed")
+            )
+        ).scalar_one()
+        await crud.create_documents(
+            db_session,
+            [
+                self._derived(
+                    "Alice works at Blue",
+                    embedding=_axis_embedding(),
+                    source_ids=[source_id],
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        loser = (
+            await db_session.execute(
+                select(models.Document).where(models.Document.level == "deductive")
+            )
+        ).scalar_one()
+        emb = _embedding_at_distance(0.09)
+        first = _AcceptedExplicit(
+            id=str(generate_nanoid()),
+            content="Alice works at Red Facility",
+            embedding=emb,
+            session_name=session.name,
+            message_ids=(80,),
+            message_created_at="2026-01-01T00:00:00Z",
+            evidence=EvidenceKey(f"{session.name}:80-80"),
+        )
+        second = _AcceptedExplicit(
+            id=str(generate_nanoid()),
+            content="Alice works at Red Building",
+            embedding=emb,
+            session_name=session.name,
+            message_ids=(81,),
+            message_created_at="2026-01-01T00:00:00Z",
+            evidence=EvidenceKey(f"{session.name}:81-81"),
+        )
+        result = await run_established_pass(
+            [first, second],
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            confirmer=FakeConfirmer(
+                ConfirmAnswer.SAME_SUBJECT_NEW_VALUE, claim_kind=ClaimKind.STATE
+            ),
+            mode="on",
+        )
+        assert len(result.superseded) == 1
+        winner_id, loser_id = result.superseded[0]
+        assert loser_id == loser.id
+        assert result.reinforced == [winner_id]
+        await db_session.refresh(loser)
+        assert loser.deleted_at is not None
+        live = (
+            (
+                await db_session.execute(
+                    select(models.Document).where(
+                        models.Document.level == "deductive",
+                        models.Document.deleted_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [row.id for row in live] == [winner_id]
+
+    @pytest.mark.asyncio
+    async def test_healer_soft_deletes_older_same_claim_duplicate(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session = await self._setup(db_session, test_workspace, test_peer)
+        await crud.create_documents(
+            db_session,
+            [
+                self._explicit(
+                    "seed",
+                    embedding=_axis_embedding(),
+                    session_name=session.name,
+                    message_id=1,
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        source_id = (
+            await db_session.execute(
+                select(models.Document.id).where(models.Document.content == "seed")
+            )
+        ).scalar_one()
+        await crud.create_documents(
+            db_session,
+            [
+                self._derived(
+                    "Alice works at Blue",
+                    embedding=_axis_embedding(),
+                    source_ids=[source_id],
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        older = (
+            await db_session.execute(
+                select(models.Document).where(models.Document.level == "deductive")
+            )
+        ).scalar_one()
+        await crud.create_documents(
+            db_session,
+            [
+                self._derived(
+                    "Alice works at Blue Facility",
+                    embedding=_embedding_at_distance(0.03),
+                    source_ids=[source_id],
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        newer = (
+            await db_session.execute(
+                select(models.Document).where(
+                    models.Document.level == "deductive",
+                    models.Document.id != older.id,
+                    models.Document.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one()
+        assert older.internal_metadata.get("superseded_by") is None
+        assert newer.internal_metadata.get("supersedes") is None
+
+        healed = await heal_live_established_pairs(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            confirmer=NeverConfirmer(),
+        )
+        assert healed.collapsed == [(newer.id, older.id)]
+        await db_session.refresh(older)
+        await db_session.refresh(newer)
+        assert older.deleted_at is not None
+        assert older.internal_metadata.get("superseded_by") == newer.id
+        assert older.id in (newer.internal_metadata.get("supersedes") or [])
+        assert newer.deleted_at is None
+        assert newer.times_derived == 1
+
+    @pytest.mark.asyncio
+    async def test_healer_candidate_band_collapses_only_with_confirm_proof(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+        established_mode,
+    ):
+        test_workspace, test_peer = sample_data
+        established_mode("off")
+        observed, session = await self._setup(db_session, test_workspace, test_peer)
+        await crud.create_documents(
+            db_session,
+            [
+                self._explicit(
+                    "seed",
+                    embedding=_axis_embedding(),
+                    session_name=session.name,
+                    message_id=1,
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        source_id = (
+            await db_session.execute(
+                select(models.Document.id).where(models.Document.content == "seed")
+            )
+        ).scalar_one()
+        await crud.create_documents(
+            db_session,
+            [
+                self._derived(
+                    "Alice works at Blue",
+                    embedding=_axis_embedding(),
+                    source_ids=[source_id],
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        older = (
+            await db_session.execute(
+                select(models.Document).where(models.Document.level == "deductive")
+            )
+        ).scalar_one()
+        await crud.create_documents(
+            db_session,
+            [
+                self._derived(
+                    "Alice works at Red Facility",
+                    embedding=_embedding_at_distance(0.09),
+                    source_ids=[source_id],
+                )
+            ],
+            test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            _established_pass=False,
+        )
+        newer = (
+            await db_session.execute(
+                select(models.Document).where(
+                    models.Document.level == "deductive",
+                    models.Document.id != older.id,
+                    models.Document.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one()
+
+        undecided = await heal_live_established_pairs(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            confirmer=NeverConfirmer(),
+        )
+        assert undecided.collapsed == []
+        assert undecided.left_unconfirmed == 1
+        await db_session.refresh(older)
+        await db_session.refresh(newer)
+        assert older.deleted_at is None
+        assert newer.deleted_at is None
+
+        proven = await heal_live_established_pairs(
+            workspace_name=test_workspace.name,
+            observer=test_peer.name,
+            observed=observed.name,
+            confirmer=FakeConfirmer(
+                ConfirmAnswer.SAME_SUBJECT_NEW_VALUE, claim_kind=ClaimKind.STATE
+            ),
+        )
+        assert proven.collapsed == [(newer.id, older.id)]
+        await db_session.refresh(older)
+        await db_session.refresh(newer)
+        assert older.deleted_at is not None
+        assert older.internal_metadata.get("superseded_by") == newer.id
+        assert newer.deleted_at is None
